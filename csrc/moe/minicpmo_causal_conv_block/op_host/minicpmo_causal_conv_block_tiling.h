@@ -24,7 +24,9 @@ BEGIN_TILING_DATA_DEF(MinicpmoCausalConvBlockTilingData)
     TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, mmTiling);
 END_TILING_DATA_DEF;
 
-struct MinicpmoCausalConvBlockCompileInfo {};
+struct MinicpmoCausalConvBlockCompileInfo {
+    uint32_t totalAicCoreNum = 0;
+};
 
 REGISTER_TILING_DATA_CLASS(MinicpmoCausalConvBlock, MinicpmoCausalConvBlockTilingData)
 

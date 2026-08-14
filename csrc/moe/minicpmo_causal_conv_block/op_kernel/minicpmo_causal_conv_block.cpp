@@ -69,6 +69,8 @@ public:
         if ASCEND_IS_AIC {
             mm_.Init(&tiling->mmTiling, &pipe_);
         } else {
+            // On Ascend 220, GetBlockIdx() already folds the AIV sub-block ID
+            // into a unique logical Vector-core index for 1:2 mixed launches.
             vectorCore_ = GetBlockIdx();
             vectorCoreCount_ = tiling->usedCoreNum * 2;
             pipe_.InitBuffer(rowBuffer_, kPackedChannels * sizeof(float));
@@ -141,6 +143,8 @@ private:
                 SetFlag<HardEvent::MTE2_MTE3>(0);
                 WaitFlag<HardEvent::MTE2_MTE3>(0);
                 DataCopy(packed[destination], rowLocal, kPackedChannels);
+                SetFlag<HardEvent::MTE3_MTE2>(0);
+                WaitFlag<HardEvent::MTE3_MTE2>(0);
                 continue;
             }
 
@@ -156,8 +160,13 @@ private:
             const uint32_t sourceTaps = frame + 1;
             DataCopy(rowLocal[cachedTaps * kChannels], source[batch * kFrames * kChannels],
                      sourceTaps * kChannels);
-            pipe_barrier(PIPE_ALL);
+            SetFlag<HardEvent::MTE2_MTE3>(0);
+            WaitFlag<HardEvent::MTE2_MTE3>(0);
+            SetFlag<HardEvent::S_MTE3>(0);
+            WaitFlag<HardEvent::S_MTE3>(0);
             DataCopy(packed[destination], rowLocal, kPackedChannels);
+            SetFlag<HardEvent::MTE3_MTE2>(0);
+            WaitFlag<HardEvent::MTE3_MTE2>(0);
         }
     }
 
@@ -235,6 +244,8 @@ private:
             SetFlag<HardEvent::V_MTE3>(0);
             WaitFlag<HardEvent::V_MTE3>(0);
             DataCopy(activatedGm_[rowIndex * kChannels], row, kChannels);
+            SetFlag<HardEvent::MTE3_MTE2>(0);
+            WaitFlag<HardEvent::MTE3_MTE2>(0);
         }
     }
 
@@ -262,6 +273,8 @@ private:
             SetFlag<HardEvent::V_MTE3>(0);
             WaitFlag<HardEvent::V_MTE3>(0);
             DataCopy(hiddenOutGm_[rowIndex * kChannels], row, kChannels);
+            SetFlag<HardEvent::MTE3_MTE2>(0);
+            WaitFlag<HardEvent::MTE3_MTE2>(0);
         }
 
         if (vectorCore_ == 0) {
@@ -276,13 +289,17 @@ private:
             const uint32_t rowBase = (batch * kFrames + kFrames - 2) * kChannels;
             const uint32_t cacheBase = batch * kChannels * 4;
             DataCopy(rows, convInputGm_[rowBase], kChannels * 2);
-            pipe_barrier(PIPE_ALL);
+            SetFlag<HardEvent::MTE2_S>(0);
+            WaitFlag<HardEvent::MTE2_S>(0);
             for (uint32_t channel = 0; channel < kChannels; ++channel) {
                 newCacheGm_.SetValue(cacheBase + channel * 2, rows.GetValue(channel));
                 newCacheGm_.SetValue(cacheBase + channel * 2 + 1, rows.GetValue(kChannels + channel));
             }
+            SetFlag<HardEvent::S_MTE2>(0);
+            WaitFlag<HardEvent::S_MTE2>(0);
             DataCopy(rows, activatedGm_[rowBase], kChannels * 2);
-            pipe_barrier(PIPE_ALL);
+            SetFlag<HardEvent::MTE2_S>(0);
+            WaitFlag<HardEvent::MTE2_S>(0);
             const uint32_t cache2Base = cacheBase + kChannels * 2;
             for (uint32_t channel = 0; channel < kChannels; ++channel) {
                 newCacheGm_.SetValue(cache2Base + channel * 2, rows.GetValue(channel));

@@ -121,6 +121,17 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     return ge::GRAPH_SUCCESS;
 }
 
-IMPL_OP_OPTILING(MinicpmoCausalConvBlock).Tiling(TilingFunc);
+static ge::graphStatus TilingPrepare(gert::TilingParseContext* context)
+{
+    auto* compileInfo = context->GetCompiledInfo<MinicpmoCausalConvBlockCompileInfo>();
+    OP_CHECK_NULL_WITH_CONTEXT(context, compileInfo);
+    auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    compileInfo->totalAicCoreNum = platform.GetCoreNumAic();
+    return ge::GRAPH_SUCCESS;
+}
+
+IMPL_OP_OPTILING(MinicpmoCausalConvBlock)
+    .Tiling(TilingFunc)
+    .TilingParse<MinicpmoCausalConvBlockCompileInfo>(TilingPrepare);
 
 }  // namespace optiling

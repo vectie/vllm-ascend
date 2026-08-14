@@ -157,6 +157,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "copy_and_expand_eagle_inputs"
         "minicpmo_causal_conv_pack"
         "minicpmo_causal_conv_block"
+        "minicpmo_causal_conv_linear"
         "causal_conv1d"
         "moe_grouped_matmul"
         "lightning_indexer_quant"
@@ -247,8 +248,11 @@ log_selected_ops
   log "subshell cwd before cd=$(pwd)"
   cd "${ROOT_DIR}/csrc"
   log "subshell cwd after cd=$(pwd)"
-  log "preserving csrc/build and cleaning output dirs"
-  rm -rf -- output build_out
+  # build.sh keeps generated operator metadata under csrc/build. Reusing that
+  # directory after CUSTOM_OPS changes can leave binary_info_config.json out of
+  # sync with the kernels in the package (or retain a dead compiler lock).
+  log "cleaning generated csrc build/output dirs"
+  rm -rf -- build output build_out
 
   : "${CUSTOM_OPS:?CUSTOM_OPS is not set}"
   : "${SOC_VERSION:?SOC_VERSION is not set}"

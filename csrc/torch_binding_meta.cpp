@@ -579,6 +579,16 @@ std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_pack_meta(
     return {packed, new_cache};
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_linear_meta(
+    const at::Tensor& x,
+    const at::Tensor& cache,
+    const at::Tensor& weight,
+    const at::Tensor& bias)
+{
+    return {at::empty_symint(x.sym_sizes(), x.options()),
+            at::empty_symint(cache.sym_sizes(), cache.options())};
+}
+
 std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_block_meta(
     const at::Tensor& hidden,
     const at::Tensor& conv_input,
@@ -1623,6 +1633,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_causal_conv1d_custom", &vllm_ascend::meta::npu_causal_conv1d_custom_meta);
     ops.impl("npu_minicpmo_causal_conv_pack",
              &vllm_ascend::meta::npu_minicpmo_causal_conv_pack_meta);
+    ops.impl("npu_minicpmo_causal_conv_linear",
+             &vllm_ascend::meta::npu_minicpmo_causal_conv_linear_meta);
     ops.impl("npu_minicpmo_causal_conv_block",
              &vllm_ascend::meta::npu_minicpmo_causal_conv_block_meta);
     // moe_grouped_matmul

@@ -8,6 +8,7 @@ import torch
 
 _PACK_REGISTERED = False
 _BLOCK_REGISTERED = False
+_LINEAR_REGISTERED = False
 
 
 def register_minicpmo_causal_conv_pack_converter() -> None:
@@ -36,6 +37,29 @@ def register_minicpmo_causal_conv_pack_converter() -> None:
         )
 
     _PACK_REGISTERED = True
+
+
+def register_minicpmo_causal_conv_linear_converter() -> None:
+    """Expose the 910C causal pack + Cube projection operator to TorchAir."""
+    global _LINEAR_REGISTERED
+    if _LINEAR_REGISTERED:
+        return
+
+    from torch_npu.dynamo import torchair
+    from torchair.ge import custom_op
+
+    op = torch.ops._C_ascend.npu_minicpmo_causal_conv_linear.default
+
+    @torchair.register_fx_node_ge_converter(op)
+    def convert_minicpmo_causal_conv_linear(x, cache, weight, bias, meta_outputs=None):
+        del meta_outputs
+        return custom_op(
+            "MinicpmoCausalConvLinear",
+            inputs={"x": x, "cache": cache, "weight": weight, "bias": bias},
+            outputs=["projected", "new_cache"],
+        )
+
+    _LINEAR_REGISTERED = True
 
 
 def register_minicpmo_causal_conv_block_converter() -> None:

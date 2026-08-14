@@ -675,6 +675,34 @@ std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_pack(
     return {packed, new_cache};
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_linear(
+    const at::Tensor& x,
+    const at::Tensor& cache,
+    const at::Tensor& weight,
+    const at::Tensor& bias)
+{
+    TORCH_CHECK(x.dim() == 3 && x.size(0) == 2 && x.size(1) == 50 && x.size(2) == 512,
+                "MiniCPM-o causal Conv linear expects x [2, 50, 512]");
+    TORCH_CHECK(cache.dim() == 3 && cache.size(0) == 2 && cache.size(1) == 512 && cache.size(2) == 2,
+                "MiniCPM-o causal Conv linear expects cache [2, 512, 2]");
+    TORCH_CHECK(weight.dim() == 2 && weight.size(0) == 512 && weight.size(1) == 1536,
+                "MiniCPM-o causal Conv linear expects weight [512, 1536]");
+    TORCH_CHECK(bias.dim() == 1 && bias.size(0) == 512,
+                "MiniCPM-o causal Conv linear expects bias [512]");
+    TORCH_CHECK(x.scalar_type() == at::kFloat,
+                "MiniCPM-o causal Conv linear currently supports FP32 only");
+    TORCH_CHECK(cache.scalar_type() == x.scalar_type() && weight.scalar_type() == x.scalar_type() &&
+                    bias.scalar_type() == x.scalar_type(),
+                "all MiniCPM-o causal Conv linear tensors must have the same dtype");
+    TORCH_CHECK(x.device() == cache.device() && x.device() == weight.device() && x.device() == bias.device(),
+                "all MiniCPM-o causal Conv linear tensors must be on the same device");
+
+    at::Tensor projected = at::empty_like(x);
+    at::Tensor new_cache = at::empty_like(cache);
+    EXEC_NPU_CMD(aclnnMinicpmoCausalConvLinear, x, cache, weight, bias, projected, new_cache);
+    return {projected, new_cache};
+}
+
 std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_block(
     const at::Tensor& hidden,
     const at::Tensor& conv_input,
@@ -2420,6 +2448,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "-> (Tensor packed, Tensor new_cache)");
     ops.impl("npu_minicpmo_causal_conv_pack", torch::kPrivateUse1,
              &vllm_ascend::npu_minicpmo_causal_conv_pack);
+    ops.def(
+        "npu_minicpmo_causal_conv_linear(Tensor x, Tensor cache, Tensor weight, Tensor bias) "
+        "-> (Tensor projected, Tensor new_cache)");
+    ops.impl("npu_minicpmo_causal_conv_linear", torch::kPrivateUse1,
+             &vllm_ascend::npu_minicpmo_causal_conv_linear);
     ops.def(
         "npu_minicpmo_causal_conv_block("
         "Tensor hidden, Tensor conv_input, Tensor cnn_cache, Tensor gate_conv, "

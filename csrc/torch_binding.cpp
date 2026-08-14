@@ -675,6 +675,71 @@ std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_pack(
     return {packed, new_cache};
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_block(
+    const at::Tensor& hidden,
+    const at::Tensor& conv_input,
+    const at::Tensor& cnn_cache,
+    const at::Tensor& gate_conv,
+    const at::Tensor& conv1_weight,
+    const at::Tensor& conv1_bias,
+    const at::Tensor& norm_weight,
+    const at::Tensor& norm_bias,
+    const at::Tensor& conv2_weight,
+    const at::Tensor& conv2_bias)
+{
+    TORCH_CHECK(hidden.dim() == 3 && hidden.size(0) == 2 && hidden.size(1) == 50 && hidden.size(2) == 512,
+                "MiniCPM-o mixed Conv block expects hidden [2, 50, 512]");
+    TORCH_CHECK(conv_input.sizes() == hidden.sizes(), "conv_input must match hidden");
+    TORCH_CHECK(cnn_cache.dim() == 3 && cnn_cache.size(0) == 2 && cnn_cache.size(1) == 1024 &&
+                    cnn_cache.size(2) == 2,
+                "MiniCPM-o mixed Conv block expects cnn_cache [2, 1024, 2]");
+    TORCH_CHECK(gate_conv.dim() == 3 && gate_conv.size(0) == 2 && gate_conv.size(1) == 1 &&
+                    gate_conv.size(2) == 512,
+                "MiniCPM-o mixed Conv block expects gate_conv [2, 1, 512]");
+    TORCH_CHECK(conv1_weight.dim() == 2 && conv1_weight.size(0) == 512 && conv1_weight.size(1) == 1536,
+                "conv1_weight must be flattened to [512, 1536]");
+    TORCH_CHECK(conv2_weight.dim() == 2 && conv2_weight.size(0) == 512 && conv2_weight.size(1) == 1536,
+                "conv2_weight must be flattened to [512, 1536]");
+    TORCH_CHECK(conv1_bias.numel() == 512 && norm_weight.numel() == 512 && norm_bias.numel() == 512 &&
+                    conv2_bias.numel() == 512,
+                "MiniCPM-o mixed Conv block bias and normalization vectors must have 512 elements");
+    TORCH_CHECK(hidden.scalar_type() == at::kFloat,
+                "MiniCPM-o mixed Conv block currently supports FP32 only");
+    TORCH_CHECK(conv_input.scalar_type() == hidden.scalar_type() &&
+                    cnn_cache.scalar_type() == hidden.scalar_type() &&
+                    gate_conv.scalar_type() == hidden.scalar_type() &&
+                    conv1_weight.scalar_type() == hidden.scalar_type() &&
+                    conv1_bias.scalar_type() == hidden.scalar_type() &&
+                    norm_weight.scalar_type() == hidden.scalar_type() &&
+                    norm_bias.scalar_type() == hidden.scalar_type() &&
+                    conv2_weight.scalar_type() == hidden.scalar_type() &&
+                    conv2_bias.scalar_type() == hidden.scalar_type(),
+                "all MiniCPM-o mixed Conv block tensors must have the same dtype");
+    TORCH_CHECK(hidden.device() == conv_input.device() && hidden.device() == cnn_cache.device() &&
+                    hidden.device() == gate_conv.device() && hidden.device() == conv1_weight.device() &&
+                    hidden.device() == conv1_bias.device() && hidden.device() == norm_weight.device() &&
+                    hidden.device() == norm_bias.device() && hidden.device() == conv2_weight.device() &&
+                    hidden.device() == conv2_bias.device(),
+                "all MiniCPM-o mixed Conv block tensors must be on the same device");
+
+    at::Tensor hidden_out = at::empty_like(hidden);
+    at::Tensor new_cache = at::empty_like(cnn_cache);
+    EXEC_NPU_CMD(aclnnMinicpmoCausalConvBlock,
+                 hidden,
+                 conv_input,
+                 cnn_cache,
+                 gate_conv,
+                 conv1_weight,
+                 conv1_bias,
+                 norm_weight,
+                 norm_bias,
+                 conv2_weight,
+                 conv2_bias,
+                 hidden_out,
+                 new_cache);
+    return {hidden_out, new_cache};
+}
+
 // It is expected that further improvements will be made after it is incorporated into CANN on June 30th.
 std::vector<at::Tensor> moe_grouped_matmul(
     at::Tensor x,
@@ -2355,6 +2420,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "-> (Tensor packed, Tensor new_cache)");
     ops.impl("npu_minicpmo_causal_conv_pack", torch::kPrivateUse1,
              &vllm_ascend::npu_minicpmo_causal_conv_pack);
+    ops.def(
+        "npu_minicpmo_causal_conv_block("
+        "Tensor hidden, Tensor conv_input, Tensor cnn_cache, Tensor gate_conv, "
+        "Tensor conv1_weight, Tensor conv1_bias, Tensor norm_weight, Tensor norm_bias, "
+        "Tensor conv2_weight, Tensor conv2_bias) "
+        "-> (Tensor hidden_out, Tensor new_cache)");
+    ops.impl("npu_minicpmo_causal_conv_block", torch::kPrivateUse1,
+             &vllm_ascend::npu_minicpmo_causal_conv_block);
     ops.def(
         "moe_grouped_matmul("
             "Tensor x,"

@@ -156,6 +156,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "transpose_kv_cache_by_block"
         "copy_and_expand_eagle_inputs"
         "minicpmo_causal_conv_pack"
+        "minicpmo_causal_conv_block"
         "causal_conv1d"
         "moe_grouped_matmul"
         "lightning_indexer_quant"

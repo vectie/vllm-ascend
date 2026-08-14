@@ -39,13 +39,23 @@ def register_minicpmo_causal_conv_pack_converter() -> None:
 
 
 def register_minicpmo_causal_conv_block_converter() -> None:
-    """Expose the FP32 910C two-Conv MIX kernel to TorchAir."""
+    """Lower the fused eager block into a GE-visible Conv graph.
+
+    The ACLNN MIX kernel remains the eager implementation of
+    ``npu_minicpmo_causal_conv_block``.  Replaying that kernel as a single GE
+    custom node, however, hides its two matrix multiplications, LayerNorm,
+    Mish, gated residual, and cache assembly from Graph Engine.  Keep only the
+    model-specific causal packing as custom nodes and expose all compute-heavy
+    work as native GE primitives so GE can schedule and optimize it together
+    with the surrounding MLP.
+    """
     global _BLOCK_REGISTERED
     if _BLOCK_REGISTERED:
         return
 
     from torch_npu.dynamo import torchair
-    from torchair.ge import custom_op
+    from torchair._ge_concrete_graph import ge_apis as ge
+    from torchair.ge import Const, DataType, custom_op
 
     op = torch.ops._C_ascend.npu_minicpmo_causal_conv_block.default
 
@@ -64,21 +74,61 @@ def register_minicpmo_causal_conv_block_converter() -> None:
         meta_outputs=None,
     ):
         del meta_outputs
-        return custom_op(
-            "MinicpmoCausalConvBlock",
-            inputs={
-                "hidden": hidden,
-                "conv_input": conv_input,
-                "cnn_cache": cnn_cache,
-                "gate_conv": gate_conv,
-                "conv1_weight": conv1_weight,
-                "conv1_bias": conv1_bias,
-                "norm_weight": norm_weight,
-                "norm_bias": norm_bias,
-                "conv2_weight": conv2_weight,
-                "conv2_bias": conv2_bias,
-            },
-            outputs=["hidden_out", "new_cache"],
+
+        cache1, cache2 = ge.SplitV(
+            cnn_cache,
+            Const([512, 512], dtype=DataType.DT_INT64),
+            Const(1, dtype=DataType.DT_INT32),
+            num_split=2,
         )
+
+        packed1, new_cache1 = custom_op(
+            "MinicpmoCausalConvPack",
+            inputs={"x": conv_input, "cache": cache1},
+            outputs=["packed", "new_cache"],
+        )
+        convolution = ge.MatMulV2(
+            packed1,
+            conv1_weight,
+            conv1_bias,
+            None,
+            transpose_x2=True,
+        )
+        convolution = ge.Reshape(
+            convolution,
+            Const([2, 50, 512], dtype=DataType.DT_INT64),
+        )
+        convolution, _, _ = ge.LayerNormV4(
+            convolution,
+            Const([512], dtype=DataType.DT_INT64),
+            gamma=norm_weight,
+            beta=norm_bias,
+            epsilon=1e-5,
+        )
+        convolution = ge.Mish(convolution)
+
+        packed2, new_cache2 = custom_op(
+            "MinicpmoCausalConvPack",
+            inputs={"x": convolution, "cache": cache2},
+            outputs=["packed", "new_cache"],
+        )
+        convolution = ge.MatMulV2(
+            packed2,
+            conv2_weight,
+            conv2_bias,
+            None,
+            transpose_x2=True,
+        )
+        convolution = ge.Reshape(
+            convolution,
+            Const([2, 50, 512], dtype=DataType.DT_INT64),
+        )
+        hidden_out = ge.Add(hidden, ge.Mul(gate_conv, convolution))
+        new_cache = ge.ConcatV2(
+            [new_cache1, new_cache2],
+            Const(1, dtype=DataType.DT_INT32),
+            N=2,
+        )
+        return hidden_out, new_cache
 
     _BLOCK_REGISTERED = True

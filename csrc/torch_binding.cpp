@@ -655,6 +655,26 @@ at::Tensor npu_causal_conv1d_custom(
     return output;
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_pack(
+    const at::Tensor& x,
+    const at::Tensor& cache)
+{
+    TORCH_CHECK(x.dim() == 3 && x.size(0) == 2 && x.size(1) == 50 && x.size(2) == 512,
+                "MiniCPM-o causal Conv pack expects x [2, 50, 512]");
+    TORCH_CHECK(cache.dim() == 3 && cache.size(0) == 2 && cache.size(1) == 512 && cache.size(2) == 2,
+                "MiniCPM-o causal Conv pack expects cache [2, 512, 2]");
+    TORCH_CHECK(x.scalar_type() == cache.scalar_type(), "x and cache must have the same dtype");
+    TORCH_CHECK(x.scalar_type() == at::kHalf || x.scalar_type() == at::kFloat ||
+                    x.scalar_type() == at::kBFloat16,
+                "MiniCPM-o causal Conv pack supports FP16, FP32, and BF16");
+    TORCH_CHECK(x.device() == cache.device(), "x and cache must be on the same device");
+
+    at::Tensor packed = at::empty({100, 1536}, x.options());
+    at::Tensor new_cache = at::empty(cache.sizes(), cache.options());
+    EXEC_NPU_CMD(aclnnMinicpmoCausalConvPack, x, cache, packed, new_cache);
+    return {packed, new_cache};
+}
+
 // It is expected that further improvements will be made after it is incorporated into CANN on June 30th.
 std::vector<at::Tensor> moe_grouped_matmul(
     at::Tensor x,
@@ -2330,6 +2350,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                         int run_mode"
         ") -> (Tensor output)");
     ops.impl("npu_causal_conv1d_custom", torch::kPrivateUse1, &vllm_ascend::npu_causal_conv1d_custom);
+    ops.def(
+        "npu_minicpmo_causal_conv_pack(Tensor x, Tensor cache) "
+        "-> (Tensor packed, Tensor new_cache)");
+    ops.impl("npu_minicpmo_causal_conv_pack", torch::kPrivateUse1,
+             &vllm_ascend::npu_minicpmo_causal_conv_pack);
     ops.def(
         "moe_grouped_matmul("
             "Tensor x,"

@@ -568,6 +568,17 @@ at::Tensor npu_causal_conv1d_custom_meta(
     return output;
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_pack_meta(
+    const at::Tensor& x,
+    const at::Tensor& cache)
+{
+    const c10::SymInt packed_rows = x.sym_size(0) * x.sym_size(1);
+    const c10::SymInt packed_columns = x.sym_size(2) * c10::SymInt(3);
+    at::Tensor packed = at::empty_symint({packed_rows, packed_columns}, x.options());
+    at::Tensor new_cache = at::empty_symint(cache.sym_sizes(), cache.options());
+    return {packed, new_cache};
+}
+
 at::Tensor npu_causal_conv1d_310_meta(
     const at::Tensor& x,
     const at::Tensor& weight,
@@ -1594,6 +1605,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_copy_and_expand_eagle_inputs", &vllm_ascend::meta::npu_copy_and_expand_eagle_inputs_meta);
     // causal_conv1d_fn
     ops.impl("npu_causal_conv1d_custom", &vllm_ascend::meta::npu_causal_conv1d_custom_meta);
+    ops.impl("npu_minicpmo_causal_conv_pack",
+             &vllm_ascend::meta::npu_minicpmo_causal_conv_pack_meta);
     // moe_grouped_matmul
     ops.impl("moe_grouped_matmul", &vllm_ascend::meta::moe_grouped_matmul_meta);
     ops.impl("moe_gating_top_k_hash", &vllm_ascend::meta::moe_gating_top_k_hash_meta);

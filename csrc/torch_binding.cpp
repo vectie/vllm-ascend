@@ -661,8 +661,12 @@ std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_pack(
 {
     TORCH_CHECK(x.dim() == 3 && x.size(0) == 2 && x.size(1) == 50 && x.size(2) == 512,
                 "MiniCPM-o causal Conv pack expects x [2, 50, 512]");
-    TORCH_CHECK(cache.dim() == 3 && cache.size(0) == 2 && cache.size(1) == 512 && cache.size(2) == 2,
-                "MiniCPM-o causal Conv pack expects cache [2, 512, 2]");
+    const bool channel_major_cache =
+        cache.dim() == 3 && cache.size(0) == 2 && cache.size(1) == 512 && cache.size(2) == 2;
+    const bool cache_major =
+        cache.dim() == 3 && cache.size(0) == 2 && cache.size(1) == 2 && cache.size(2) == 512;
+    TORCH_CHECK(channel_major_cache || cache_major,
+                "MiniCPM-o causal Conv pack expects cache [2, 512, 2] or [2, 2, 512]");
     TORCH_CHECK(x.scalar_type() == cache.scalar_type(), "x and cache must have the same dtype");
     TORCH_CHECK(x.scalar_type() == at::kHalf || x.scalar_type() == at::kFloat ||
                     x.scalar_type() == at::kBFloat16,

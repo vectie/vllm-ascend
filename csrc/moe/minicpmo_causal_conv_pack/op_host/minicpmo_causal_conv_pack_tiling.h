@@ -17,6 +17,7 @@ BEGIN_TILING_DATA_DEF(MinicpmoCausalConvPackTilingData)
     TILING_DATA_FIELD_DEF(uint32_t, channels);
     TILING_DATA_FIELD_DEF(uint32_t, rowsPerCore);
     TILING_DATA_FIELD_DEF(uint32_t, usedCoreNum);
+    TILING_DATA_FIELD_DEF(uint32_t, cacheMajor);
 END_TILING_DATA_DEF;
 
 struct MinicpmoCausalConvPackCompileInfo {

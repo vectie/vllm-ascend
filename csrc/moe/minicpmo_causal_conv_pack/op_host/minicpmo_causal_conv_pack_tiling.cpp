@@ -27,8 +27,13 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     OP_CHECK_IF(batch != 2 || frames != 50 || channels != 512,
                 OP_LOGE(context, "expected x [2,50,512], got [%u,%u,%u]", batch, frames, channels),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(cache.GetDim(0) != batch || cache.GetDim(1) != channels || cache.GetDim(2) != 2,
-                OP_LOGE(context, "expected cache [2,512,2]"), return ge::GRAPH_FAILED);
+    const bool channelMajorCache =
+        cache.GetDim(0) == batch && cache.GetDim(1) == channels && cache.GetDim(2) == 2;
+    const bool cacheMajor =
+        cache.GetDim(0) == batch && cache.GetDim(1) == 2 && cache.GetDim(2) == channels;
+    OP_CHECK_IF(!channelMajorCache && !cacheMajor,
+                OP_LOGE(context, "expected cache [2,512,2] or [2,2,512]"),
+                return ge::GRAPH_FAILED);
 
     const uint32_t totalRows = batch * frames;
     auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
@@ -44,6 +49,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     tiling.set_channels(channels);
     tiling.set_rowsPerCore(rowsPerCore);
     tiling.set_usedCoreNum(usedCoreNum);
+    tiling.set_cacheMajor(cacheMajor ? 1U : 0U);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
     context->SetBlockDim(usedCoreNum);

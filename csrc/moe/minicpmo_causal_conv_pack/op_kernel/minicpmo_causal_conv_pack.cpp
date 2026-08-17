@@ -17,6 +17,7 @@ public:
         channels_ = tiling->channels;
         rowsPerCore_ = tiling->rowsPerCore;
         totalRows_ = batch_ * frames_;
+        cacheMajor_ = tiling->cacheMajor != 0;
         core_ = GetBlockIdx();
         startRow_ = core_ * rowsPerCore_;
         endRow_ = min(startRow_ + rowsPerCore_, totalRows_);
@@ -50,6 +51,10 @@ private:
         if (sourceFrame >= 0) {
             const uint32_t source = (batch * frames_ + static_cast<uint32_t>(sourceFrame)) * channels_;
             DataCopy(local, xGm_[source], channels_);
+        } else if (cacheMajor_) {
+            const uint32_t cacheTap = static_cast<uint32_t>(sourceFrame + 2);
+            const uint32_t source = batch * channels_ * 2 + cacheTap * channels_;
+            DataCopy(local, cacheGm_[source], channels_);
         } else {
             const uint32_t cacheTap = static_cast<uint32_t>(sourceFrame + 2);
             const uint32_t cacheBase = batch * channels_ * 2;
@@ -71,9 +76,14 @@ private:
             DataCopy(local, xGm_[xBase], channels_ * 2);
             pipe_barrier(PIPE_ALL);
             const uint32_t cacheBase = batch * channels_ * 2;
-            for (uint32_t channel = 0; channel < channels_; ++channel) {
-                newCacheGm_.SetValue(cacheBase + channel * 2, local.GetValue(channel));
-                newCacheGm_.SetValue(cacheBase + channel * 2 + 1, local.GetValue(channels_ + channel));
+            if (cacheMajor_) {
+                DataCopy(newCacheGm_[cacheBase], local, channels_ * 2);
+                pipe_barrier(PIPE_ALL);
+            } else {
+                for (uint32_t channel = 0; channel < channels_; ++channel) {
+                    newCacheGm_.SetValue(cacheBase + channel * 2, local.GetValue(channel));
+                    newCacheGm_.SetValue(cacheBase + channel * 2 + 1, local.GetValue(channels_ + channel));
+                }
             }
         }
     }
@@ -93,6 +103,7 @@ private:
     uint32_t core_ = 0;
     uint32_t startRow_ = 0;
     uint32_t endRow_ = 0;
+    bool cacheMajor_ = false;
 };
 
 extern "C" __global__ __aicore__ void minicpmo_causal_conv_pack(

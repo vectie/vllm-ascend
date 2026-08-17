@@ -41,6 +41,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # scenarios in an environment without an NPU. Do not set it to False in
     # other scenarios.
     "COMPILE_CUSTOM_KERNELS": lambda: bool(int(os.getenv("COMPILE_CUSTOM_KERNELS", "1"))),
+    # Rebuild the extension against an already-installed repo-local ACLNN
+    # package without invoking the expensive custom-op package build again.
+    "VLLM_ASCEND_SKIP_ACLNN_BUILD": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SKIP_ACLNN_BUILD", "0"))
+    ),
     # The CXX compiler used for compiling the package. If not set, the default
     # value is None, which means the system default CXX compiler will be used.
     "CXX_COMPILER": lambda: os.getenv("CXX_COMPILER", None),
@@ -90,6 +95,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # `dispatch_ffn_combine` can be used only for moe layer with W8A8, EP<=32, non-mtp, non-dynamic-eplb.
     # `mega_moe` can be used only for moe layer with W8A8/W4A8/bf16(none quant), EP<=64, non-dynamic-eplb.
     "VLLM_ASCEND_ENABLE_FUSED_MC2": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "0")),
+    # Enable MatmulAllReduce fusion when tensor parallelism is active. Keep it
+    # opt-in because current support and profitability depend on model and SoC.
+    "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0"))
+    ),
     # DEPRECATED: VLLM_ASCEND_BALANCE_SCHEDULING env var will be removed in a future release.
     # Use --additional-config '{"enable_balance_scheduling": true}' instead.
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),

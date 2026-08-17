@@ -131,6 +131,10 @@ if (BUILD_OPEN_PROJECT)
 
         include(cmake/third_party/makeself-fetch.cmake)
         include(cmake/opbuild.cmake)
+        # Operator subsets may change between incremental package builds.
+        # Rebuild the AICPU object-target registry from the currently selected
+        # ops instead of retaining targets from a previous CMake configure.
+        unset(AICPU_CUST_OBJ_TARGETS CACHE)
         include(cmake/custom_build.cmake)
         message(STATUS "End building custom package.")
         if (ENABLE_OPS_HOST)

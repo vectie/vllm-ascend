@@ -108,6 +108,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "transpose_kv_cache_by_block"
         "copy_and_expand_eagle_inputs"
         "minicpmo_causal_conv_pack"
+        "minicpmo_qkv_pack"
         "causal_conv1d"
         "lightning_indexer_quant"
         "compressor"
@@ -156,6 +157,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "transpose_kv_cache_by_block"
         "copy_and_expand_eagle_inputs"
         "minicpmo_causal_conv_pack"
+        "minicpmo_qkv_pack"
         "minicpmo_causal_conv_block"
         "minicpmo_causal_conv_linear"
         "causal_conv1d"
@@ -225,6 +227,12 @@ else
     # currently, no custom aclnn ops for other series
     log "no custom ACLNN ops configured for SOC_VERSION=${SOC_VERSION}; skip build_aclnn"
     exit 0
+fi
+
+if [[ -n "${VLLM_ASCEND_CUSTOM_OPS:-}" ]]; then
+    CUSTOM_OPS="${VLLM_ASCEND_CUSTOM_OPS}"
+    IFS=';' read -r -a CUSTOM_OPS_ARRAY <<< "${CUSTOM_OPS}"
+    log "using VLLM_ASCEND_CUSTOM_OPS override"
 fi
 
 log_selected_ops

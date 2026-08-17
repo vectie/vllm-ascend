@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 
 _PACK_REGISTERED = False
+_QKV_PACK_REGISTERED = False
 _BLOCK_REGISTERED = False
 _LINEAR_REGISTERED = False
 
@@ -37,6 +38,29 @@ def register_minicpmo_causal_conv_pack_converter() -> None:
         )
 
     _PACK_REGISTERED = True
+
+
+def register_minicpmo_qkv_pack_converter() -> None:
+    """Expose the fixed MiniCPM-o BSH-to-BNSD QKV layout operator."""
+    global _QKV_PACK_REGISTERED
+    if _QKV_PACK_REGISTERED:
+        return
+
+    from torch_npu.dynamo import torchair
+    from torchair.ge import custom_op
+
+    op = torch.ops._C_ascend.npu_minicpmo_qkv_pack.default
+
+    @torchair.register_fx_node_ge_converter(op)
+    def convert_minicpmo_qkv_pack(q, k, v, meta_outputs=None):
+        del meta_outputs
+        return custom_op(
+            "MinicpmoQkvPack",
+            inputs={"q": q, "k": k, "v": v},
+            outputs=["q_out", "k_out", "v_out"],
+        )
+
+    _QKV_PACK_REGISTERED = True
 
 
 def register_minicpmo_causal_conv_linear_converter() -> None:

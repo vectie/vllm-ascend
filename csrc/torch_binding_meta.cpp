@@ -579,6 +579,20 @@ std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_pack_meta(
     return {packed, new_cache};
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_minicpmo_qkv_pack_meta(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v)
+{
+    const c10::SymInt batch = q.sym_size(0);
+    const c10::SymInt frames = q.sym_size(1);
+    const std::vector<c10::SymInt> output_shape = {
+        batch, c10::SymInt(8), frames, c10::SymInt(64)};
+    return {at::empty_symint(output_shape, q.options()),
+            at::empty_symint(output_shape, k.options()),
+            at::empty_symint(output_shape, v.options())};
+}
+
 std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_linear_meta(
     const at::Tensor& x,
     const at::Tensor& cache,
@@ -1633,6 +1647,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_causal_conv1d_custom", &vllm_ascend::meta::npu_causal_conv1d_custom_meta);
     ops.impl("npu_minicpmo_causal_conv_pack",
              &vllm_ascend::meta::npu_minicpmo_causal_conv_pack_meta);
+    ops.impl("npu_minicpmo_qkv_pack",
+             &vllm_ascend::meta::npu_minicpmo_qkv_pack_meta);
     ops.impl("npu_minicpmo_causal_conv_linear",
              &vllm_ascend::meta::npu_minicpmo_causal_conv_linear_meta);
     ops.impl("npu_minicpmo_causal_conv_block",

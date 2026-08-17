@@ -679,6 +679,31 @@ std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_pack(
     return {packed, new_cache};
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_minicpmo_qkv_pack(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v)
+{
+    for (const auto* tensor : {&q, &k, &v}) {
+        TORCH_CHECK(tensor->dim() == 3 && tensor->size(0) == 2 && tensor->size(1) == 50 &&
+                        tensor->size(2) == 512,
+                    "MiniCPM-o QKV pack expects q/k/v [2, 50, 512]");
+        TORCH_CHECK(tensor->scalar_type() == q.scalar_type(),
+                    "MiniCPM-o QKV pack inputs must have the same dtype");
+        TORCH_CHECK(tensor->device() == q.device(),
+                    "MiniCPM-o QKV pack inputs must be on the same device");
+    }
+    TORCH_CHECK(q.scalar_type() == at::kHalf || q.scalar_type() == at::kFloat ||
+                    q.scalar_type() == at::kBFloat16,
+                "MiniCPM-o QKV pack supports FP16, FP32, and BF16");
+    const std::vector<int64_t> output_shape = {2, 8, 50, 64};
+    at::Tensor q_out = at::empty(output_shape, q.options());
+    at::Tensor k_out = at::empty(output_shape, k.options());
+    at::Tensor v_out = at::empty(output_shape, v.options());
+    EXEC_NPU_CMD(aclnnMinicpmoQkvPack, q, k, v, q_out, k_out, v_out);
+    return {q_out, k_out, v_out};
+}
+
 std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_linear(
     const at::Tensor& x,
     const at::Tensor& cache,
@@ -2452,6 +2477,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "-> (Tensor packed, Tensor new_cache)");
     ops.impl("npu_minicpmo_causal_conv_pack", torch::kPrivateUse1,
              &vllm_ascend::npu_minicpmo_causal_conv_pack);
+    ops.def(
+        "npu_minicpmo_qkv_pack(Tensor q, Tensor k, Tensor v) "
+        "-> (Tensor q_out, Tensor k_out, Tensor v_out)");
+    ops.impl("npu_minicpmo_qkv_pack", torch::kPrivateUse1,
+             &vllm_ascend::npu_minicpmo_qkv_pack);
     ops.def(
         "npu_minicpmo_causal_conv_linear(Tensor x, Tensor cache, Tensor weight, Tensor bias) "
         "-> (Tensor projected, Tensor new_cache)");

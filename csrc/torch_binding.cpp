@@ -659,8 +659,9 @@ std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_pack(
     const at::Tensor& x,
     const at::Tensor& cache)
 {
-    TORCH_CHECK(x.dim() == 3 && x.size(0) == 2 && x.size(1) == 50 && x.size(2) == 512,
-                "MiniCPM-o causal Conv pack expects x [2, 50, 512]");
+    TORCH_CHECK(x.dim() == 3 && x.size(0) == 2 &&
+                    (x.size(1) == 50 || x.size(1) == 64) && x.size(2) == 512,
+                "MiniCPM-o causal Conv pack expects x [2, 50|64, 512]");
     const bool channel_major_cache =
         cache.dim() == 3 && cache.size(0) == 2 && cache.size(1) == 512 && cache.size(2) == 2;
     const bool cache_major =
@@ -673,7 +674,7 @@ std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_pack(
                 "MiniCPM-o causal Conv pack supports FP16, FP32, and BF16");
     TORCH_CHECK(x.device() == cache.device(), "x and cache must be on the same device");
 
-    at::Tensor packed = at::empty({100, 1536}, x.options());
+    at::Tensor packed = at::empty({x.size(0) * x.size(1), x.size(2) * 3}, x.options());
     at::Tensor new_cache = at::empty(cache.sizes(), cache.options());
     EXEC_NPU_CMD(aclnnMinicpmoCausalConvPack, x, cache, packed, new_cache);
     return {packed, new_cache};

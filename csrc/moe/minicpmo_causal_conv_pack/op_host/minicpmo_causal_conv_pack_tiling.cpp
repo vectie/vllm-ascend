@@ -24,8 +24,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     const uint32_t batch = static_cast<uint32_t>(x.GetDim(0));
     const uint32_t frames = static_cast<uint32_t>(x.GetDim(1));
     const uint32_t channels = static_cast<uint32_t>(x.GetDim(2));
-    OP_CHECK_IF(batch != 2 || frames != 50 || channels != 512,
-                OP_LOGE(context, "expected x [2,50,512], got [%u,%u,%u]", batch, frames, channels),
+    OP_CHECK_IF(batch != 2 || (frames != 50 && frames != 64) || channels != 512,
+                OP_LOGE(context, "expected x [2,50|64,512], got [%u,%u,%u]", batch, frames, channels),
                 return ge::GRAPH_FAILED);
     const bool channelMajorCache =
         cache.GetDim(0) == batch && cache.GetDim(1) == channels && cache.GetDim(2) == 2;

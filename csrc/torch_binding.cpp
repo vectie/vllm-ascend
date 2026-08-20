@@ -798,6 +798,35 @@ std::tuple<at::Tensor, at::Tensor> npu_minicpmo_causal_conv_block(
     return {hidden_out, new_cache};
 }
 
+at::Tensor npu_minicpmo_final_adaln(
+    const at::Tensor& hidden,
+    const at::Tensor& modulation,
+    const at::Tensor& weight,
+    const at::Tensor& bias)
+{
+    TORCH_CHECK(hidden.dim() == 3 && hidden.size(0) == 2 && hidden.size(1) == 50 && hidden.size(2) == 512,
+                "MiniCPM-o final AdaLN expects hidden [2, 50, 512]");
+    TORCH_CHECK(modulation.dim() == 3 && modulation.size(0) == 2 && modulation.size(1) == 1 &&
+                    modulation.size(2) == 1024,
+                "MiniCPM-o final AdaLN expects modulation [2, 1, 1024]");
+    TORCH_CHECK(weight.dim() == 2 && weight.size(0) == 80 && weight.size(1) == 512,
+                "MiniCPM-o final AdaLN expects weight [80, 512]");
+    TORCH_CHECK(bias.dim() == 1 && bias.size(0) == 80,
+                "MiniCPM-o final AdaLN expects bias [80]");
+    TORCH_CHECK(hidden.scalar_type() == at::kFloat,
+                "MiniCPM-o final AdaLN currently supports FP32 only");
+    TORCH_CHECK(modulation.scalar_type() == hidden.scalar_type() &&
+                    weight.scalar_type() == hidden.scalar_type() && bias.scalar_type() == hidden.scalar_type(),
+                "all MiniCPM-o final AdaLN tensors must have the same dtype");
+    TORCH_CHECK(hidden.device() == modulation.device() && hidden.device() == weight.device() &&
+                    hidden.device() == bias.device(),
+                "all MiniCPM-o final AdaLN tensors must be on the same device");
+
+    at::Tensor projected = at::empty({2, 50, 80}, hidden.options());
+    EXEC_NPU_CMD(aclnnMinicpmoFinalAdaln, hidden, modulation, weight, bias, projected);
+    return projected;
+}
+
 // It is expected that further improvements will be made after it is incorporated into CANN on June 30th.
 std::vector<at::Tensor> moe_grouped_matmul(
     at::Tensor x,
@@ -2496,6 +2525,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "-> (Tensor hidden_out, Tensor new_cache)");
     ops.impl("npu_minicpmo_causal_conv_block", torch::kPrivateUse1,
              &vllm_ascend::npu_minicpmo_causal_conv_block);
+    ops.def(
+        "npu_minicpmo_final_adaln(Tensor hidden, Tensor modulation, Tensor weight, Tensor bias) "
+        "-> Tensor");
+    ops.impl("npu_minicpmo_final_adaln", torch::kPrivateUse1,
+             &vllm_ascend::npu_minicpmo_final_adaln);
     ops.def(
         "moe_grouped_matmul("
             "Tensor x,"

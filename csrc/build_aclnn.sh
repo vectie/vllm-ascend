@@ -160,6 +160,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "minicpmo_qkv_pack"
         "minicpmo_causal_conv_block"
         "minicpmo_causal_conv_linear"
+        "minicpmo_final_adaln"
         "causal_conv1d"
         "moe_grouped_matmul"
         "lightning_indexer_quant"

@@ -11,6 +11,24 @@ import torch
 from vllm_ascend.utils import enable_custom_op
 
 
+def _reference(
+    x: torch.Tensor,
+    channel_major_cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch, frames, channels = x.shape
+    history = torch.cat((channel_major_cache, x.transpose(1, 2)), dim=2)
+    packed = torch.stack(
+        [
+            history[:, :, offset : offset + 3]
+            .transpose(1, 2)
+            .reshape(batch, channels * 3)
+            for offset in range(frames)
+        ],
+        dim=1,
+    ).reshape(batch * frames, channels * 3)
+    return packed, x[:, -2:, :].transpose(1, 2).contiguous()
+
+
 def _measure_trial_us(fn: Callable[[], object], iterations: int) -> float:
     start = time.perf_counter_ns()
     for _ in range(iterations):
@@ -40,6 +58,21 @@ def main() -> None:
 
     baseline_packed, baseline_cache = baseline()
     candidate_packed, candidate_cache = candidate()
+    expected_packed, expected_channel_major_cache = _reference(x, channel_major)
+    torch.testing.assert_close(baseline_packed, expected_packed, rtol=0, atol=0)
+    torch.testing.assert_close(
+        baseline_cache,
+        expected_channel_major_cache,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(candidate_packed, expected_packed, rtol=0, atol=0)
+    torch.testing.assert_close(
+        candidate_cache,
+        expected_channel_major_cache.transpose(1, 2).contiguous(),
+        rtol=0,
+        atol=0,
+    )
     torch.testing.assert_close(candidate_packed, baseline_packed, rtol=0, atol=0)
     torch.testing.assert_close(
         candidate_cache.transpose(1, 2),

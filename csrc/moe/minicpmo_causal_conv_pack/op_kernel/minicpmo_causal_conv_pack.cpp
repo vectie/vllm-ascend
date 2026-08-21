@@ -28,6 +28,7 @@ public:
         newCacheGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(newCache), batch_ * channels_ * 2);
         pipe_.InitBuffer(frameBuffer_, channels_ * sizeof(T));
         pipe_.InitBuffer(cacheBuffer_, channels_ * 2 * sizeof(T));
+        pipe_.InitBuffer(cacheLayoutBuffer_, channels_ * 2 * sizeof(T));
     }
 
     __aicore__ inline void Process()
@@ -35,6 +36,10 @@ public:
         for (uint32_t row = startRow_; row < endRow_; ++row) {
             const uint32_t batch = row / frames_;
             const int32_t frame = static_cast<int32_t>(row % frames_);
+            if (!cacheMajor_ && frame < 2) {
+                CopyChannelMajorPrefix(batch, frame, row);
+                continue;
+            }
             for (int32_t tap = 0; tap < 3; ++tap) {
                 CopyTap(batch, frame + tap - 2, row, static_cast<uint32_t>(tap));
             }
@@ -45,6 +50,34 @@ public:
     }
 
 private:
+    __aicore__ inline void CopyLocalTap(const LocalTensor<T>& local, uint32_t row, uint32_t tap)
+    {
+        const uint32_t destination = row * channels_ * 3 + tap * channels_;
+        DataCopy(packedGm_[destination], local, channels_);
+        pipe_barrier(PIPE_ALL);
+    }
+
+    __aicore__ inline void CopyChannelMajorPrefix(uint32_t batch, int32_t frame, uint32_t row)
+    {
+        LocalTensor<T> cache = cacheBuffer_.Get<T>();
+        LocalTensor<T> frames = cacheLayoutBuffer_.Get<T>();
+        const uint32_t cacheBase = batch * channels_ * 2;
+        DataCopy(cache, cacheGm_[cacheBase], channels_ * 2);
+        pipe_barrier(PIPE_ALL);
+        DeInterleave(frames, frames[channels_], cache, channels_ * 2);
+        pipe_barrier(PIPE_ALL);
+
+        if (frame == 0) {
+            CopyLocalTap(frames, row, 0);
+            CopyLocalTap(frames[channels_], row, 1);
+            CopyTap(batch, 0, row, 2);
+        } else {
+            CopyLocalTap(frames[channels_], row, 0);
+            CopyTap(batch, 0, row, 1);
+            CopyTap(batch, 1, row, 2);
+        }
+    }
+
     __aicore__ inline void CopyTap(uint32_t batch, int32_t sourceFrame, uint32_t row, uint32_t tap)
     {
         LocalTensor<T> local = frameBuffer_.Get<T>();
@@ -71,6 +104,7 @@ private:
     __aicore__ inline void UpdateCache()
     {
         LocalTensor<T> local = cacheBuffer_.Get<T>();
+        LocalTensor<T> packed = cacheLayoutBuffer_.Get<T>();
         for (uint32_t batch = 0; batch < batch_; ++batch) {
             const uint32_t xBase = (batch * frames_ + frames_ - 2) * channels_;
             DataCopy(local, xGm_[xBase], channels_ * 2);
@@ -80,10 +114,10 @@ private:
                 DataCopy(newCacheGm_[cacheBase], local, channels_ * 2);
                 pipe_barrier(PIPE_ALL);
             } else {
-                for (uint32_t channel = 0; channel < channels_; ++channel) {
-                    newCacheGm_.SetValue(cacheBase + channel * 2, local.GetValue(channel));
-                    newCacheGm_.SetValue(cacheBase + channel * 2 + 1, local.GetValue(channels_ + channel));
-                }
+                Interleave(packed, packed[channels_], local, local[channels_], channels_);
+                pipe_barrier(PIPE_ALL);
+                DataCopy(newCacheGm_[cacheBase], packed, channels_ * 2);
+                pipe_barrier(PIPE_ALL);
             }
         }
     }
@@ -91,6 +125,7 @@ private:
     TPipe pipe_;
     TBuf<TPosition::VECCALC> frameBuffer_;
     TBuf<TPosition::VECCALC> cacheBuffer_;
+    TBuf<TPosition::VECCALC> cacheLayoutBuffer_;
     GlobalTensor<T> xGm_;
     GlobalTensor<T> cacheGm_;
     GlobalTensor<T> packedGm_;

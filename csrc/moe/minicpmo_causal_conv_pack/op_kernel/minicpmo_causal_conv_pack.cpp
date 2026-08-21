@@ -29,7 +29,8 @@ public:
         newCacheGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(newCache), batch_ * channels_ * 2);
         pipe_.InitBuffer(frameBuffer_, channels_ * sizeof(T));
         pipe_.InitBuffer(cacheBuffer_, channels_ * 2 * sizeof(T));
-        pipe_.InitBuffer(indexBuffer_, channels_ * sizeof(uint32_t));
+        pipe_.InitBuffer(cacheLayoutBuffer_, channels_ * 2 * sizeof(T));
+        pipe_.InitBuffer(indexBuffer_, channels_ * 2 * sizeof(uint32_t));
     }
 
     __aicore__ inline void Process()
@@ -117,6 +118,8 @@ private:
     __aicore__ inline void UpdateCache()
     {
         LocalTensor<T> local = cacheBuffer_.Get<T>();
+        LocalTensor<T> packed = cacheLayoutBuffer_.Get<T>();
+        LocalTensor<uint32_t> offsets = indexBuffer_.Get<uint32_t>();
         for (uint32_t batch = 0; batch < batch_; ++batch) {
             const uint32_t xBase = (batch * frames_ + frames_ - 2) * channels_;
             DataCopy(local, xGm_[xBase], channels_ * 2);
@@ -126,11 +129,23 @@ private:
                 DataCopy(newCacheGm_[cacheBase], local, channels_ * 2);
                 pipe_barrier(PIPE_ALL);
             } else {
-                DataCopyExtParams scatterParams{
-                    static_cast<uint16_t>(channels_), static_cast<uint32_t>(sizeof(T)), 0,
-                    static_cast<uint32_t>(sizeof(T)), 0};
-                DataCopyPad(newCacheGm_[cacheBase], local, scatterParams);
-                DataCopyPad(newCacheGm_[cacheBase + 1], local[channels_], scatterParams);
+                for (uint32_t output = 0; output < channels_ * 2; ++output) {
+                    const uint32_t frame = output & 1;
+                    const uint32_t channel = output >> 1;
+                    offsets.SetValue(output, (frame * channels_ + channel) * sizeof(T));
+                }
+                event_t scalarToVector =
+                    static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_V));
+                SetFlag<HardEvent::S_V>(scalarToVector);
+                WaitFlag<HardEvent::S_V>(scalarToVector);
+                Gather(
+                    packed,
+                    local,
+                    offsets,
+                    static_cast<uint32_t>(0),
+                    channels_ * 2);
+                pipe_barrier(PIPE_ALL);
+                DataCopy(newCacheGm_[cacheBase], packed, channels_ * 2);
                 pipe_barrier(PIPE_ALL);
             }
         }
@@ -139,6 +154,7 @@ private:
     TPipe pipe_;
     TBuf<TPosition::VECCALC> frameBuffer_;
     TBuf<TPosition::VECCALC> cacheBuffer_;
+    TBuf<TPosition::VECCALC> cacheLayoutBuffer_;
     TBuf<TPosition::VECCALC> indexBuffer_;
     GlobalTensor<T> xGm_;
     GlobalTensor<T> cacheGm_;

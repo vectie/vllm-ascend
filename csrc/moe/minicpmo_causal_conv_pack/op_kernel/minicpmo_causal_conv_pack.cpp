@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "kernel_operator.h"
+#include "basic_api/kernel_vec_intf.h"
 
 using namespace AscendC;
 

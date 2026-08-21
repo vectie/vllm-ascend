@@ -35,7 +35,7 @@ public:
 
     __aicore__ inline void Process()
     {
-        if (!cacheMajor_ && NeedsChannelMajorOffsets()) {
+        if (!cacheMajor_) {
             LocalTensor<int32_t> offsets = indexBuffer_.Get<int32_t>();
             CreateVecIndex(offsets, 0, channels_);
             pipe_barrier(PIPE_ALL);
@@ -59,18 +59,6 @@ public:
     }
 
 private:
-    __aicore__ inline bool NeedsChannelMajorOffsets() const
-    {
-        for (uint32_t batch = 0; batch < batch_; ++batch) {
-            const uint32_t prefixStart = batch * frames_;
-            const uint32_t prefixEnd = prefixStart + 2;
-            if (startRow_ < prefixEnd && endRow_ > prefixStart) {
-                return true;
-            }
-        }
-        return core_ == 0;
-    }
-
     __aicore__ inline void CopyLocalTap(const LocalTensor<T>& local, uint32_t row, uint32_t tap)
     {
         const uint32_t destination = row * channels_ * 3 + tap * channels_;
@@ -132,17 +120,6 @@ private:
         LocalTensor<T> local = cacheBuffer_.Get<T>();
         LocalTensor<T> packed = cacheLayoutBuffer_.Get<T>();
         LocalTensor<uint32_t> offsets = indexBuffer_.Get<uint32_t>();
-        if (!cacheMajor_) {
-            for (uint32_t output = 0; output < channels_ * 2; ++output) {
-                const uint32_t frame = output & 1;
-                const uint32_t channel = output >> 1;
-                offsets.SetValue(output, (frame * channels_ + channel) * sizeof(T));
-            }
-            event_t scalarToVector =
-                static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_V));
-            SetFlag<HardEvent::S_V>(scalarToVector);
-            WaitFlag<HardEvent::S_V>(scalarToVector);
-        }
         for (uint32_t batch = 0; batch < batch_; ++batch) {
             const uint32_t xBase = (batch * frames_ + frames_ - 2) * channels_;
             DataCopy(local, xGm_[xBase], channels_ * 2);
@@ -152,6 +129,15 @@ private:
                 DataCopy(newCacheGm_[cacheBase], local, channels_ * 2);
                 pipe_barrier(PIPE_ALL);
             } else {
+                for (uint32_t output = 0; output < channels_ * 2; ++output) {
+                    const uint32_t frame = output & 1;
+                    const uint32_t channel = output >> 1;
+                    offsets.SetValue(output, (frame * channels_ + channel) * sizeof(T));
+                }
+                event_t scalarToVector =
+                    static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_V));
+                SetFlag<HardEvent::S_V>(scalarToVector);
+                WaitFlag<HardEvent::S_V>(scalarToVector);
                 Gather(
                     packed,
                     local,

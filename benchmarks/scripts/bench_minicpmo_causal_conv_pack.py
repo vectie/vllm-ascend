@@ -37,6 +37,13 @@ def _measure_trial_us(fn: Callable[[], object], iterations: int) -> float:
     return (time.perf_counter_ns() - start) / iterations / 1_000
 
 
+def _measure_serialized_us(fn: Callable[[], object]) -> float:
+    start = time.perf_counter_ns()
+    fn()
+    torch.npu.synchronize()
+    return (time.perf_counter_ns() - start) / 1_000
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmups", type=int, default=50)
@@ -88,13 +95,19 @@ def main() -> None:
 
     baseline_us: list[float] = []
     candidate_us: list[float] = []
+    baseline_serialized_us: list[float] = []
+    candidate_serialized_us: list[float] = []
     for trial in range(args.trials):
         if trial % 2:
             candidate_us.append(_measure_trial_us(candidate, args.iterations))
             baseline_us.append(_measure_trial_us(baseline, args.iterations))
+            candidate_serialized_us.append(_measure_serialized_us(candidate))
+            baseline_serialized_us.append(_measure_serialized_us(baseline))
         else:
             baseline_us.append(_measure_trial_us(baseline, args.iterations))
             candidate_us.append(_measure_trial_us(candidate, args.iterations))
+            baseline_serialized_us.append(_measure_serialized_us(baseline))
+            candidate_serialized_us.append(_measure_serialized_us(candidate))
 
     baseline_median = statistics.median(baseline_us)
     candidate_median = statistics.median(candidate_us)
@@ -103,6 +116,14 @@ def main() -> None:
     print(f"speedup={baseline_median / candidate_median:.4f}x")
     print(f"channel_major_min_us={min(baseline_us):.3f}")
     print(f"cache_major_min_us={min(candidate_us):.3f}")
+    print(
+        "channel_major_serialized_median_us="
+        f"{statistics.median(baseline_serialized_us):.3f}"
+    )
+    print(
+        "cache_major_serialized_median_us="
+        f"{statistics.median(candidate_serialized_us):.3f}"
+    )
 
 
 if __name__ == "__main__":

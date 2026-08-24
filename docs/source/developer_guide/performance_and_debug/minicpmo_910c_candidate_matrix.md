@@ -11,7 +11,7 @@ characterize the device; unprofiled runs decide benchmark acceptance.
 | R1 | Hardware counter profile | Attribute idle AIC/AIV, MTE stalls, L2 pressure, and layout conversions | Diagnostic only |
 | R2 | Pipelined causal pack | Replace per-tap DMA and `PIPE_ALL` with two UB rows and exact MTE2/MTE3 events | Candidate |
 | R3 | Causal tiling and cache publication | Launch only non-empty AIVs and publish rolling cache from row owners without a GM reread | Candidate |
-| R4 | Whole-head QKV stride DMA | Replace 50 per-frame copies with one strided read and one contiguous write per Q/K/V head | Candidate |
+| R4 | Ping-pong whole-head QKV DMA | Replace 50 per-frame copies with one strided read and one contiguous write per head; overlap K/Q and V/K transfers | Candidate |
 
 R2 applies to both cache layouts. Channel-major uses Gather only for the first
 two rows of each batch; its remaining 48 rows use the same contiguous pipeline

@@ -30,27 +30,56 @@ public:
         // MTE3 performs one contiguous DMA per Q/K/V tensor. The previous
         // implementation issued 50 load/store pairs and two PIPE_ALL barriers
         // per tensor.
-        pipe_.InitBuffer(headBuffer_, frames_ * headDim_ * sizeof(T));
+        pipe_.InitBuffer(headBuffer_, 2 * frames_ * headDim_ * sizeof(T));
+        for (uint32_t slot = 0; slot < 2; ++slot) {
+            loadToStoreEvents_[slot] =
+                GetTPipePtr()->AllocEventID<HardEvent::MTE2_MTE3>();
+            storeToLoadEvents_[slot] =
+                GetTPipePtr()->AllocEventID<HardEvent::MTE3_MTE2>();
+        }
     }
 
     __aicore__ inline void Process()
     {
         const uint32_t batch = core_ / heads_;
         const uint32_t head = core_ % heads_;
-        CopyTensor(qGm_, qOutGm_, batch, head);
-        CopyTensor(kGm_, kOutGm_, batch, head);
-        CopyTensor(vGm_, vOutGm_, batch, head);
+        // Ping-pong complete heads: K input overlaps Q output, then V input
+        // overlaps K output. There are only three tensors, so spell out the
+        // schedule and keep every dependency explicit.
+        LoadTensor(qGm_, batch, head, 0);
+        WaitFlag<HardEvent::MTE2_MTE3>(loadToStoreEvents_[0]);
+        LoadTensor(kGm_, batch, head, 1);
+        StoreTensor(qOutGm_, batch, head, 0);
+
+        WaitFlag<HardEvent::MTE2_MTE3>(loadToStoreEvents_[1]);
+        WaitFlag<HardEvent::MTE3_MTE2>(storeToLoadEvents_[0]);
+        LoadTensor(vGm_, batch, head, 0);
+        StoreTensor(kOutGm_, batch, head, 1);
+
+        WaitFlag<HardEvent::MTE2_MTE3>(loadToStoreEvents_[0]);
+        StoreTensor(vOutGm_, batch, head, 0);
+        WaitFlag<HardEvent::MTE3_MTE2>(storeToLoadEvents_[1]);
+        WaitFlag<HardEvent::MTE3_MTE2>(storeToLoadEvents_[0]);
+
+        for (uint32_t slot = 0; slot < 2; ++slot) {
+            GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_MTE3>(
+                loadToStoreEvents_[slot]);
+            GetTPipePtr()->ReleaseEventID<HardEvent::MTE3_MTE2>(
+                storeToLoadEvents_[slot]);
+        }
     }
 
 private:
-    __aicore__ inline void CopyTensor(GlobalTensor<T>& input, GlobalTensor<T>& output,
-                                      uint32_t batch, uint32_t head)
+    __aicore__ inline void LoadTensor(
+        GlobalTensor<T>& input,
+        uint32_t batch,
+        uint32_t head,
+        uint32_t slot)
     {
-        LocalTensor<T> local = headBuffer_.Get<T>();
+        const uint32_t headElements = frames_ * headDim_;
+        LocalTensor<T> local = headBuffer_.Get<T>()[slot * headElements];
         const uint32_t source =
             (batch * frames_ * heads_ + head) * headDim_;
-        const uint32_t destination =
-            (batch * heads_ + head) * frames_ * headDim_;
         const uint16_t blockLen = static_cast<uint16_t>(
             headDim_ * sizeof(T) / 32);
         const uint16_t sourceStride = static_cast<uint16_t>(
@@ -62,11 +91,21 @@ private:
             0,
         };
         DataCopy(local, input[source], gatherHeads);
-        SetFlag<HardEvent::MTE2_MTE3>(0);
-        WaitFlag<HardEvent::MTE2_MTE3>(0);
-        DataCopy(output[destination], local, frames_ * headDim_);
-        SetFlag<HardEvent::MTE3_MTE2>(0);
-        WaitFlag<HardEvent::MTE3_MTE2>(0);
+        SetFlag<HardEvent::MTE2_MTE3>(loadToStoreEvents_[slot]);
+    }
+
+    __aicore__ inline void StoreTensor(
+        GlobalTensor<T>& output,
+        uint32_t batch,
+        uint32_t head,
+        uint32_t slot)
+    {
+        const uint32_t headElements = frames_ * headDim_;
+        LocalTensor<T> local = headBuffer_.Get<T>()[slot * headElements];
+        const uint32_t destination =
+            (batch * heads_ + head) * headElements;
+        DataCopy(output[destination], local, headElements);
+        SetFlag<HardEvent::MTE3_MTE2>(storeToLoadEvents_[slot]);
     }
 
     TPipe pipe_;
@@ -82,6 +121,8 @@ private:
     uint32_t heads_ = 0;
     uint32_t headDim_ = 0;
     uint32_t core_ = 0;
+    TEventID loadToStoreEvents_[2] = {0, 0};
+    TEventID storeToLoadEvents_[2] = {0, 0};
 };
 
 extern "C" __global__ __aicore__ void minicpmo_qkv_pack(

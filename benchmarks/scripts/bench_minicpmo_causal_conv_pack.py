@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Microbenchmark MiniCPM-o causal packing cache layouts on Ascend."""
+"""Microbenchmark MiniCPM-o causal packing cache layouts on Ascend.
+
+The cache-major candidate exercises the 910B/C two-slot MTE2/MTE3 pipeline;
+the channel-major control retains the Gather-based compatibility path.
+"""
 
 import argparse
 import statistics
@@ -9,6 +13,12 @@ from collections.abc import Callable
 import torch
 
 from vllm_ascend.utils import enable_custom_op
+
+_DTYPES = {
+    "float16": torch.float16,
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+}
 
 
 def _reference(
@@ -49,12 +59,14 @@ def main() -> None:
     parser.add_argument("--warmups", type=int, default=50)
     parser.add_argument("--iterations", type=int, default=300)
     parser.add_argument("--trials", type=int, default=15)
+    parser.add_argument("--dtype", choices=sorted(_DTYPES), default="float32")
     args = parser.parse_args()
 
     enable_custom_op()
     torch.manual_seed(20260817)
-    x = torch.randn(2, 50, 512, device="npu", dtype=torch.float32)
-    channel_major = torch.randn(2, 512, 2, device="npu", dtype=torch.float32)
+    dtype = _DTYPES[args.dtype]
+    x = torch.randn(2, 50, 512, device="npu", dtype=dtype)
+    channel_major = torch.randn(2, 512, 2, device="npu", dtype=dtype)
     cache_major = channel_major.transpose(1, 2).contiguous()
 
     def baseline() -> tuple[torch.Tensor, torch.Tensor]:
@@ -111,17 +123,18 @@ def main() -> None:
 
     baseline_median = statistics.median(baseline_us)
     candidate_median = statistics.median(candidate_us)
+    print(f"dtype={args.dtype}")
     print(f"channel_major_median_us={baseline_median:.3f}")
-    print(f"cache_major_median_us={candidate_median:.3f}")
+    print(f"cache_major_pipelined_median_us={candidate_median:.3f}")
     print(f"speedup={baseline_median / candidate_median:.4f}x")
     print(f"channel_major_min_us={min(baseline_us):.3f}")
-    print(f"cache_major_min_us={min(candidate_us):.3f}")
+    print(f"cache_major_pipelined_min_us={min(candidate_us):.3f}")
     print(
         "channel_major_serialized_median_us="
         f"{statistics.median(baseline_serialized_us):.3f}"
     )
     print(
-        "cache_major_serialized_median_us="
+        "cache_major_pipelined_serialized_median_us="
         f"{statistics.median(candidate_serialized_us):.3f}"
     )
 

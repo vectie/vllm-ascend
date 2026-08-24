@@ -40,8 +40,16 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     const uint32_t availableCoreNum = platform.GetCoreNumAiv();
     OP_CHECK_IF(availableCoreNum == 0,
                 OP_LOGE(context, "no vector cores are available"), return ge::GRAPH_FAILED);
-    const uint32_t usedCoreNum = std::min(totalRows, availableCoreNum);
-    const uint32_t rowsPerCore = (totalRows + usedCoreNum - 1) / usedCoreNum;
+    const uint32_t targetCoreNum = std::min(totalRows, availableCoreNum);
+    const uint32_t rowsPerCore =
+        (totalRows + targetCoreNum - 1) / targetCoreNum;
+    // Ceil-dividing rows across all available cores can leave the final
+    // blocks with startRow >= totalRows (for example 100 rows / 40 AIVs gives
+    // 3 rows per core but needs only 34 cores). Do not launch those empty
+    // blocks: apart from wasting scalar setup, an unsigned local-row count in
+    // a pipelined kernel would wrap around.
+    const uint32_t usedCoreNum =
+        (totalRows + rowsPerCore - 1) / rowsPerCore;
 
     MinicpmoCausalConvPackTilingData tiling;
     tiling.set_batch(batch);

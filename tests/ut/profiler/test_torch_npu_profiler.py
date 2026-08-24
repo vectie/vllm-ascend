@@ -63,6 +63,8 @@ class TestTorchNPUProfilerWrapper(TestBase):
         from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 
         mock_envs_ascend.MSMONITOR_USE_DAEMON = 0
+        mock_envs_ascend.VLLM_ASCEND_PROFILER_L2_CACHE = False
+        mock_envs_ascend.VLLM_ASCEND_PROFILER_OP_ATTR = False
         mock_get_ascend_config.side_effect = RuntimeError("Ascend config is not initialized")
 
         profiler_config = ProfilerConfig(
@@ -116,6 +118,42 @@ class TestTorchNPUProfilerWrapper(TestBase):
         self.assertEqual(profile_kwargs["with_modules"], True)
         self.assertEqual(profile_kwargs["on_trace_ready"], mock_trace_handler_instance)
         self.assertEqual(result, mock_profiler_instance)
+
+    @patch("vllm_ascend.profiler.torch_npu_profiler.envs_ascend")
+    @patch("vllm_ascend.profiler.torch_npu_profiler.get_ascend_config")
+    @patch("torch_npu.profiler._ExperimentalConfig")
+    @patch("torch_npu.profiler.profile")
+    @patch("torch_npu.profiler.tensorboard_trace_handler")
+    def test_create_profiler_enables_hardware_characterization_counters(
+        self,
+        mock_trace_handler,
+        mock_profile,
+        mock_experimental_config,
+        mock_get_ascend_config,
+        mock_envs_ascend,
+    ):
+        from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
+
+        mock_envs_ascend.MSMONITOR_USE_DAEMON = 0
+        mock_envs_ascend.VLLM_ASCEND_PROFILER_L2_CACHE = True
+        mock_envs_ascend.VLLM_ASCEND_PROFILER_OP_ATTR = True
+        mock_get_ascend_config.side_effect = RuntimeError(
+            "Ascend config is not initialized"
+        )
+        mock_trace_handler.return_value = MagicMock()
+        mock_profile.return_value = MagicMock()
+
+        TorchNPUProfilerWrapper._create_profiler(
+            ProfilerConfig(
+                profiler="torch",
+                torch_profiler_dir="/path/to/traces",
+            ),
+            "910c-characterization",
+        )
+
+        config_kwargs = mock_experimental_config.call_args.kwargs
+        self.assertTrue(config_kwargs["l2_cache"])
+        self.assertTrue(config_kwargs["op_attr"])
 
     def test_create_profiler_disabled(self):
         from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper

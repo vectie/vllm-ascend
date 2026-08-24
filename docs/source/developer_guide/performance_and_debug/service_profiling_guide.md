@@ -46,6 +46,23 @@ python3 -m vllm.entrypoints.openai.api_server \
 --max-model-len 256
 ```
 
+The profiler always collects `PipeUtilization` counters. For a short hardware
+characterization run, additionally enable L2-cache counters and operator
+attributes before starting the server:
+
+```bash
+export VLLM_ASCEND_PROFILER_L2_CACHE=1
+export VLLM_ASCEND_PROFILER_OP_ATTR=1
+```
+
+Do not use these two switches for benchmark timing: extra counters and
+attributes increase profiling overhead. Use them to identify AIC/AIV pipeline
+gaps, cache pressure, and layout-conversion producers, then disable profiling
+and rerun the unchanged candidate for latency acceptance.
+
+The MiniCPM-o 4.5 910C operator, service, and accuracy sequence is tracked in
+[the candidate matrix](minicpmo_910c_candidate_matrix.md).
+
 > Note: **January 19, 2026: The vLLM mainline has deprecated the VLLM_TORCH_PROFILER_DIR environment variable.** [Related PR](https://github.com/vllm-project/vllm-ascend/pull/5928)  When using the vLLM Ascend mainline code to collect profiler data, remember to use the `--profiler-config` (online) parameter or the `profiler_config` (offline) parameter.
 
 ### 2. Start Collection

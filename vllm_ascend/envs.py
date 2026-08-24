@@ -77,6 +77,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_FLASHCOMM1": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0"))),
     # Whether to enable msMonitor tool to monitor the performance of vllm-ascend.
     "MSMONITOR_USE_DAEMON": lambda: bool(int(os.getenv("MSMONITOR_USE_DAEMON", "0"))),
+    # Collect L2-cache counters in Ascend PyTorch profiler traces. Disabled by
+    # default because hardware-counter collection perturbs serving latency;
+    # enable it only for bounded characterization runs.
+    "VLLM_ASCEND_PROFILER_L2_CACHE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_PROFILER_L2_CACHE", "0"))
+    ),
+    # Include operator attributes in Ascend PyTorch profiler traces. This is
+    # useful when correlating layout/format conversions with their producers,
+    # but increases trace size and is therefore opt-in.
+    "VLLM_ASCEND_PROFILER_OP_ATTR": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_PROFILER_OP_ATTR", "0"))
+    ),
     # Whether to enable MLAPO optimization for DeepSeek W8A8 series models.
     # This option is enabled by default. MLAPO can improve performance, but
     # it will consume more NPU memory. If reducing NPU memory usage is a higher priority

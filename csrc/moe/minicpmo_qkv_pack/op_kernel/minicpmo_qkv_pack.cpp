@@ -25,7 +25,12 @@ public:
         qOutGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(qOut), elements);
         kOutGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(kOut), elements);
         vOutGm_.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(vOut), elements);
-        pipe_.InitBuffer(headBuffer_, headDim_ * sizeof(T));
+        // One head is strided in BSH input but contiguous in BNSD output.
+        // Stage the complete 50x64 head so MTE2 performs one strided DMA and
+        // MTE3 performs one contiguous DMA per Q/K/V tensor. The previous
+        // implementation issued 50 load/store pairs and two PIPE_ALL barriers
+        // per tensor.
+        pipe_.InitBuffer(headBuffer_, frames_ * headDim_ * sizeof(T));
     }
 
     __aicore__ inline void Process()
@@ -42,14 +47,26 @@ private:
                                       uint32_t batch, uint32_t head)
     {
         LocalTensor<T> local = headBuffer_.Get<T>();
-        for (uint32_t frame = 0; frame < frames_; ++frame) {
-            const uint32_t source = ((batch * frames_ + frame) * heads_ + head) * headDim_;
-            const uint32_t destination = ((batch * heads_ + head) * frames_ + frame) * headDim_;
-            DataCopy(local, input[source], headDim_);
-            pipe_barrier(PIPE_ALL);
-            DataCopy(output[destination], local, headDim_);
-            pipe_barrier(PIPE_ALL);
-        }
+        const uint32_t source =
+            (batch * frames_ * heads_ + head) * headDim_;
+        const uint32_t destination =
+            (batch * heads_ + head) * frames_ * headDim_;
+        const uint16_t blockLen = static_cast<uint16_t>(
+            headDim_ * sizeof(T) / 32);
+        const uint16_t sourceStride = static_cast<uint16_t>(
+            (heads_ - 1) * blockLen);
+        DataCopyParams gatherHeads{
+            static_cast<uint16_t>(frames_),
+            blockLen,
+            sourceStride,
+            0,
+        };
+        DataCopy(local, input[source], gatherHeads);
+        SetFlag<HardEvent::MTE2_MTE3>(0);
+        WaitFlag<HardEvent::MTE2_MTE3>(0);
+        DataCopy(output[destination], local, frames_ * headDim_);
+        SetFlag<HardEvent::MTE3_MTE2>(0);
+        WaitFlag<HardEvent::MTE3_MTE2>(0);
     }
 
     TPipe pipe_;

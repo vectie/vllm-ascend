@@ -10,6 +10,12 @@ import torch
 
 from vllm_ascend.utils import enable_custom_op
 
+_DTYPES = {
+    "float16": torch.float16,
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+}
+
 
 def _measure_us(fn: Callable[[], object], iterations: int) -> float:
     start = time.perf_counter_ns()
@@ -24,11 +30,16 @@ def main() -> None:
     parser.add_argument("--warmups", type=int, default=50)
     parser.add_argument("--iterations", type=int, default=300)
     parser.add_argument("--trials", type=int, default=15)
+    parser.add_argument("--dtype", choices=sorted(_DTYPES), default="float32")
     args = parser.parse_args()
 
     enable_custom_op()
     torch.manual_seed(20260817)
-    inputs = [torch.randn(2, 50, 512, device="npu", dtype=torch.float32) for _ in range(3)]
+    dtype = _DTYPES[args.dtype]
+    inputs = [
+        torch.randn(2, 50, 512, device="npu", dtype=dtype)
+        for _ in range(3)
+    ]
 
     def baseline() -> tuple[torch.Tensor, ...]:
         return tuple(value.reshape(2, 50, 8, 64).transpose(1, 2).contiguous() for value in inputs)
@@ -55,6 +66,7 @@ def main() -> None:
 
     baseline_median = statistics.median(baseline_us)
     candidate_median = statistics.median(candidate_us)
+    print(f"dtype={args.dtype}")
     print(f"transpose_median_us={baseline_median:.3f}")
     print(f"qkv_pack_median_us={candidate_median:.3f}")
     print(f"speedup={baseline_median / candidate_median:.4f}x")

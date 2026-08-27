@@ -313,17 +313,6 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         else:
             seq_lens = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
 
-        stable_pa_graph_inputs = using_stable_paged_attention_graph_inputs(
-            common_attn_metadata.num_input_tokens, self.vllm_config
-        )
-        seq_lens_list_source = seq_lens
-        if stable_pa_graph_inputs:
-            # PA accepts context_lens as a Tensor. Point the captured task at
-            # the runner-owned NPU buffer, whose contents are refreshed in
-            # place before every replay, instead of a host tensor whose values
-            # would otherwise need a task rebuild to become visible.
-            seq_lens = common_attn_metadata.seq_lens[:num_reqs]
-
         slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]
         # this slot_mapping override doesn't work since vllm will override it again. We should fix it vllm.
         # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
@@ -342,7 +331,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
 
         actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
-        seq_lens_list = seq_lens_list_source.tolist()
+        seq_lens_list = seq_lens.tolist()
         # flashcomm1/SP (or cudagraph) padding makes the model runner insert a
         # dummy padding request into query_start_loc to satisfy the FIA TND-layout
         # constraint (sum of q lengths == hidden_states.shape[0]), bumping the

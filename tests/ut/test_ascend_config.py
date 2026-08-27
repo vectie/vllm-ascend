@@ -108,6 +108,7 @@ class TestAscendConfig(TestBase):
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertFalse(ascend_config.multistream_overlap_shared_expert)
         self.assertFalse(ascend_config.enable_kv_nz)
+        self.assertFalse(ascend_config.enable_stable_pa_graph_inputs)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
@@ -361,6 +362,7 @@ class TestAscendConfig(TestBase):
             "msmonitor_use_daemon": False,
             "enable_transpose_kv_cache_by_block": True,
             "weight_nz_mode": 1,
+            "enable_stable_pa_graph_inputs": True,
         }
         with patch.dict(
             os.environ,
@@ -381,6 +383,7 @@ class TestAscendConfig(TestBase):
         self.assertFalse(ascend_config.msmonitor_use_daemon)
         self.assertTrue(ascend_config.enable_transpose_kv_cache_by_block)
         self.assertEqual(ascend_config.weight_nz_mode, 1)
+        self.assertTrue(ascend_config.enable_stable_pa_graph_inputs)
         mock_info_once.assert_any_call("AscendConfig.enable_mlapo is set from additional_config with value True.")
         mock_info_once.assert_any_call("AscendConfig.weight_nz_mode is set from additional_config with value 1.")
 

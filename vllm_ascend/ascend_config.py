@@ -222,6 +222,11 @@ class AscendConfig:
         # _npu_paged_attention in this cases. This should be removed once
         # npu_fused_infer_attention_score performs better on all scenarios.
         self.pa_shape_list = additional_config.get("pa_shape_list", [])
+        # FULL_DECODE_ONLY reuses the model runner's fixed block-table and
+        # sequence-length input buffers. PagedAttention consumes both as tensor
+        # inputs, so an opt-in deployment can replay the captured tasks directly
+        # instead of rebuilding every attention-layer task each decode step.
+        self.enable_stable_pa_graph_inputs = additional_config.get("enable_stable_pa_graph_inputs", False)
         # Weight NZ mode configuration.
         # 0: disabled, 1: only quant case enable nz (default), 2: BF16/FP16 also enable nz
         self.weight_nz_mode = self._get_config_value(

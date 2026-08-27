@@ -52,6 +52,7 @@ from vllm_ascend.attention.utils import (
     split_decodes_and_prefills,
     update_paged_attention_graph_param,
     using_paged_attention,
+    using_stable_paged_attention_graph_inputs,
 )
 from vllm_ascend.compilation.acl_graph import (
     get_draft_graph_params,
@@ -483,6 +484,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ):
         use_layer_aware_replay = needs_layer_aware_fia_graph_replay()
         if using_paged_attention(num_tokens, vllm_config):
+            if using_stable_paged_attention_graph_inputs(num_tokens, vllm_config):
+                # The captured PA tasks already point at the model runner's
+                # persistent block-table and sequence-length buffers. Their
+                # contents are refreshed before replay, so there is no task
+                # parameter to rebind on the host.
+                return
             # Paged Attention update logic
             if _EXTRA_CTX.is_draft_model:
                 if _EXTRA_CTX.is_draft_model_prefill:
@@ -1152,6 +1159,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         graph_params = get_graph_params()
         num_tokens = query.shape[0]
         if _EXTRA_CTX.capturing:
+            stable_graph_inputs = using_stable_paged_attention_graph_inputs(num_tokens, self.vllm_config)
             # Get workspace from cache or calculate it if not present.
             workspace = graph_params.workspaces.get(num_tokens)
             if workspace is None:
@@ -1171,26 +1179,27 @@ class AscendAttentionBackendImpl(AttentionImpl):
             # Handle graph capturing mode
             stream = torch_npu.npu.current_stream()
 
-            event = torch.npu.ExternalEvent()
-            event.wait(stream)
-            event.reset(stream)
-            graph_params.events[num_tokens].append(event)
-            graph_params.attn_params[num_tokens].append(
-                PagedAttentionGraphParam(
-                    (
-                        weak_ref_tensors(query),
-                        weak_ref_tensors(self.key_cache),
-                        weak_ref_tensors(self.value_cache),
-                        self.num_kv_heads,
-                        self.num_heads,
-                        self.scale,
-                        attn_metadata.block_tables,
-                        attn_metadata.seq_lens,
-                        weak_ref_tensors(output),
-                    ),
-                    self._graph_metadata_layer_name() if self._use_layer_aware_fia_graph_replay else None,
+            if not stable_graph_inputs:
+                event = torch.npu.ExternalEvent()
+                event.wait(stream)
+                event.reset(stream)
+                graph_params.events[num_tokens].append(event)
+                graph_params.attn_params[num_tokens].append(
+                    PagedAttentionGraphParam(
+                        (
+                            weak_ref_tensors(query),
+                            weak_ref_tensors(self.key_cache),
+                            weak_ref_tensors(self.value_cache),
+                            self.num_kv_heads,
+                            self.num_heads,
+                            self.scale,
+                            attn_metadata.block_tables,
+                            attn_metadata.seq_lens,
+                            weak_ref_tensors(output),
+                        ),
+                        self._graph_metadata_layer_name() if self._use_layer_aware_fia_graph_replay else None,
+                    )
                 )
-            )
 
             torch.npu.graph_task_group_begin(stream)
             torch_npu._npu_paged_attention(
@@ -1206,7 +1215,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 workspace=workspace,
             )
             handle = torch.npu.graph_task_group_end(stream)
-            graph_params.handles[num_tokens].append(handle)
+            if not stable_graph_inputs:
+                graph_params.handles[num_tokens].append(handle)
             return output
 
     def _get_fia_params(self, key: torch.Tensor, value: torch.Tensor, attn_metadata: AscendMetadata, kv_cache=None):

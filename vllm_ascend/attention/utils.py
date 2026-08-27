@@ -178,6 +178,20 @@ def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig, head_size
     return runtime_shape in get_ascend_config().pa_shape_list
 
 
+def using_stable_paged_attention_graph_inputs(runtime_shape: int, vllm_config: VllmConfig) -> bool:
+    """Return whether PA graph tasks can consume fixed-address input buffers.
+
+    This is deliberately opt-in. FULL_DECODE_ONLY supplies persistent
+    block-table and sequence-length tensors, while PagedAttention reads their
+    values at execution time. In that configuration, replay does not need to
+    rebind every captured PA task merely because the tensor contents changed.
+    """
+
+    return bool(get_ascend_config().enable_stable_pa_graph_inputs) and using_paged_attention(
+        runtime_shape, vllm_config
+    )
+
+
 @lru_cache(maxsize=1)
 def enable_dcp():
     parallel_config = get_current_vllm_config().parallel_config

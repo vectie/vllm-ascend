@@ -18,6 +18,7 @@ from vllm_ascend.attention.utils import (
     cache_graph_workspace,
     needs_layer_aware_fia_graph_replay,
     using_paged_attention,
+    using_stable_paged_attention_graph_inputs,
 )
 from vllm_ascend.device.device_op import A5DeviceAdaptor
 from vllm_ascend.device.utils import FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE
@@ -50,6 +51,16 @@ class TestAttentionGraphHelpers(TestBase):
         vllm_config.speculative_config = None
         with patch("vllm_ascend.attention.utils.get_ascend_device_type", return_value=AscendDeviceType.A2):
             self.assertTrue(using_paged_attention(1, vllm_config, head_size=FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE))
+
+    @patch("vllm_ascend.attention.utils.using_paged_attention", return_value=True)
+    @patch("vllm_ascend.attention.utils.get_ascend_config")
+    def test_stable_paged_attention_graph_inputs_require_opt_in(self, mock_get_config, mock_using_pa):
+        mock_get_config.return_value.enable_stable_pa_graph_inputs = False
+        self.assertFalse(using_stable_paged_attention_graph_inputs(1, MagicMock()))
+
+        mock_get_config.return_value.enable_stable_pa_graph_inputs = True
+        self.assertTrue(using_stable_paged_attention_graph_inputs(1, MagicMock()))
+        mock_using_pa.assert_called_once()
 
 
 class TestAscendAttentionBackend(TestBase):
@@ -635,6 +646,24 @@ class TestAscendAttentionBackendImpl(TestBase):
         mock_fused_infer_attention_score.assert_called_once()
 
         assert output.shape == (10, 8, 64)
+
+    @patch("vllm_ascend.attention.attention_v1.get_graph_params")
+    @patch(
+        "vllm_ascend.attention.attention_v1.using_stable_paged_attention_graph_inputs",
+        return_value=True,
+    )
+    @patch("vllm_ascend.attention.attention_v1.using_paged_attention", return_value=True)
+    def test_stable_paged_attention_skips_task_rebinding(
+        self,
+        mock_using_paged_attention,
+        mock_using_stable_inputs,
+        mock_get_graph_params,
+    ):
+        self.impl.update_graph_params(self.mock_stream, MagicMock(), 1, self.mock_vllm_config)
+
+        mock_using_paged_attention.assert_called_once_with(1, self.mock_vllm_config)
+        mock_using_stable_inputs.assert_called_once_with(1, self.mock_vllm_config)
+        mock_get_graph_params.assert_not_called()
 
     @patch("torch.npu.stream")
     @patch("torch.npu.graph_task_update_begin")

@@ -11,6 +11,8 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionMetadataBuilder,
     AscendAttentionState,
     AscendC8AttentionBackendImpl,
+    _fia_bucket_reuse_key,
+    _initialize_fia_tail_mask_outside_capture,
     _round_fia_seq_lens,
     _update_fia_tail_mask,
 )
@@ -35,6 +37,17 @@ class TestAttentionGraphHelpers(TestBase):
     def test_fia_sequence_lengths_round_up_to_bucket(self):
         self.assertEqual(_round_fia_seq_lens([1, 16, 17, 31], 16), [16, 16, 32, 32])
 
+    def test_fia_bucket_reuse_key_includes_block_table_addresses(self):
+        first = torch.empty(4, dtype=torch.int32)
+        second = torch.empty(4, dtype=torch.int32)
+
+        first_key = _fia_bucket_reuse_key([17], 16, [first])
+        same_key = _fia_bucket_reuse_key([18], 16, [first])
+        new_request_key = _fia_bucket_reuse_key([18], 16, [second])
+
+        self.assertEqual(first_key, same_key)
+        self.assertNotEqual(first_key, new_request_key)
+
     def test_fia_tail_mask_preserves_only_real_prefix(self):
         mask = torch.empty((2, 1, 32), dtype=torch.bool)
 
@@ -44,6 +57,19 @@ class TestAttentionGraphHelpers(TestBase):
         self.assertTrue(mask[0, 0, 3:].all())
         self.assertFalse(mask[1, 0, :17].any())
         self.assertTrue(mask[1, 0, 17:].all())
+
+    @patch("vllm_ascend.attention.attention_v1.get_forward_context")
+    def test_fia_tail_mask_write_is_not_captured(self, mock_get_forward_context):
+        mask = torch.zeros((1, 1, 16), dtype=torch.bool)
+        mock_get_forward_context.return_value.capturing = True
+
+        _initialize_fia_tail_mask_outside_capture(mask, [3])
+        self.assertFalse(mask.any())
+
+        mock_get_forward_context.return_value.capturing = False
+        _initialize_fia_tail_mask_outside_capture(mask, [3])
+        self.assertFalse(mask[0, 0, :3].any())
+        self.assertTrue(mask[0, 0, 3:].all())
 
     @patch("vllm_ascend.attention.utils.get_ascend_config")
     def test_fia_sequence_length_bucket_is_explicit_and_non_speculative(self, mock_get_config):
@@ -775,7 +801,9 @@ class TestAscendAttentionBackendImpl(TestBase):
         mock_EXTRA_CTX.is_draft_model = False
 
         bucket_mask = torch.empty((1, 1, 32), dtype=torch.bool)
+        block_table = torch.empty(4, dtype=torch.int32)
         param: list[MagicMock | torch.Tensor | None] = [MagicMock()] * 21
+        param[3] = block_table
         param[4] = bucket_mask
         param[16] = None
         param[20] = None
@@ -785,11 +813,11 @@ class TestAscendAttentionBackendImpl(TestBase):
         graph_params.handles = {1: [MagicMock()] * 3}
         graph_params.events = {1: events}
         graph_params.workspaces = {1: MagicMock()}
-        graph_params.fia_bucket_keys = {1: (16,)}
+        graph_params.fia_bucket_keys = {1: _fia_bucket_reuse_key([5], 16, [block_table] * 3)}
 
         key = "model.layers.0.self_attn.attn"
         forward_context = MagicMock()
-        forward_context.attn_metadata = {key: MagicMock(seq_lens_list=[5])}
+        forward_context.attn_metadata = {key: MagicMock(seq_lens_list=[5], block_tables=block_table)}
 
         self.impl.update_graph_params(self.mock_stream, forward_context, 1, self.mock_vllm_config)
 

@@ -24,6 +24,7 @@ import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionBackend,
@@ -76,12 +77,30 @@ def _round_fia_seq_lens(seq_lens: list[int], bucket_size: int) -> list[int]:
     return [cdiv(max(1, int(seq_len)), bucket_size) * bucket_size for seq_len in seq_lens]
 
 
+def _fia_bucket_reuse_key(
+    seq_lens: list[int],
+    bucket_size: int,
+    block_tables: list[torch.Tensor],
+) -> tuple[int, ...]:
+    """Key task reuse by both logical length bucket and KV indirection."""
+
+    rounded_seq_lens = tuple(_round_fia_seq_lens(seq_lens, bucket_size))
+    return rounded_seq_lens + tuple(int(block_table.data_ptr()) for block_table in block_tables)
+
+
 def _update_fia_tail_mask(mask: torch.Tensor, seq_lens: list[int]) -> None:
     """Mask every physical KV slot at or after each request's real length."""
 
     mask.fill_(True)
     for row, seq_len in enumerate(seq_lens):
         mask[row, 0, : int(seq_len)].fill_(False)
+
+
+def _initialize_fia_tail_mask_outside_capture(mask: torch.Tensor, seq_lens: list[int]) -> None:
+    """Avoid recording capture-time mask writes into the replay graph."""
+
+    if not get_forward_context().capturing:
+        _update_fia_tail_mask(mask, seq_lens)
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -760,7 +779,25 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     )
                     real_seq_lens = attn_metadata[metadata_key].seq_lens_list
                     if bucket_mask is not None and bucket_mask.ndim == 3:
-                        bucket_key = tuple(_round_fia_seq_lens(real_seq_lens, bucket_size))
+                        current_block_tables: list[torch.Tensor] = []
+                        for index, captured_param in enumerate(captured_attn_params):
+                            if isinstance(captured_param, PagedAttentionGraphParam):
+                                continue
+                            captured_layer_name = captured_param[20]
+                            fallback_key = attn_keys[index % num_layers]
+                            captured_metadata_key = (
+                                captured_layer_name
+                                if captured_layer_name is not None and captured_layer_name in attn_metadata
+                                else fallback_key
+                            )
+                            current_block_tables.append(attn_metadata[captured_metadata_key].block_tables)
+                        # A rounded KV length alone is not a safe reuse key:
+                        # a new request can enter the same bucket while its KV
+                        # blocks live behind different block-table buffers.
+                        # Rebind tasks once when either component changes, then
+                        # retain the cheap mask/event-only path within the
+                        # request and bucket.
+                        bucket_key = _fia_bucket_reuse_key(real_seq_lens, bucket_size, current_block_tables)
                         # Replay has already enqueued its external-event waits
                         # when this callback runs.  Produce the shared mask on
                         # the update stream itself, before either task rebinding
@@ -944,7 +981,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             if bucket_mask is None or tuple(bucket_mask.shape) != expected_shape:
                 bucket_mask = torch.empty(expected_shape, dtype=torch.bool, device=query.device)
                 graph_params.fia_bucket_masks[num_tokens] = bucket_mask
-            _update_fia_tail_mask(bucket_mask, actual_seq_lengths_kv)
+            _initialize_fia_tail_mask_outside_capture(bucket_mask, actual_seq_lengths_kv)
             attn_mask = bucket_mask
             actual_seq_lengths_kv = _round_fia_seq_lens(actual_seq_lengths_kv, bucket_size)
             sparse_mode = 0

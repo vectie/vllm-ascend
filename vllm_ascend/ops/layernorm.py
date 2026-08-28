@@ -15,6 +15,8 @@
 #
 
 
+import os
+
 import torch
 from torch import nn
 from vllm.config import get_current_vllm_config
@@ -23,6 +25,19 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm, RMSNormG
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.triton.layernorm_gated import layer_norm_fwd_npu
 from vllm_ascend.utils import enable_custom_op
+
+
+def _enable_add_rms_norm_bias() -> bool:
+    """Whether the optional AddRmsNormBias ACLNN kernel may be traced.
+
+    Some A2 CANN packages register the vLLM-Ascend custom-op wrapper while
+    their operator package does not contain AddRmsNormBias.  Keep the fused
+    path as the default, but provide a narrow opt-out so those systems can use
+    the widely available npu_add_rms_norm kernel without disabling unrelated
+    custom kernels.
+    """
+    raw = os.environ.get("VLLM_ASCEND_ENABLE_ADD_RMS_NORM_BIAS", "1")
+    return raw.strip().lower() not in {"0", "false", "off"} and enable_custom_op()
 
 
 class AscendRMSNorm(RMSNorm):
@@ -69,7 +84,7 @@ class AscendRMSNorm(RMSNorm):
 
         if residual is not None:
             residual = torch.ops.vllm.maybe_chunk_residual(x, residual)
-            if enable_custom_op():
+            if _enable_add_rms_norm_bias():
                 x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
                     x, residual, self.weight, self.bias, self.variance_epsilon
                 )
@@ -96,7 +111,7 @@ class AscendGemmaRMSNorm(GemmaRMSNorm):
 
         if residual is not None:
             residual = torch.ops.vllm.maybe_chunk_residual(x, residual)
-            if enable_custom_op():
+            if _enable_add_rms_norm_bias():
                 x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
                     x, residual, 1.0 + self.weight, None, self.variance_epsilon
                 )

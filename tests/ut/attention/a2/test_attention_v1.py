@@ -11,13 +11,17 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionMetadataBuilder,
     AscendAttentionState,
     AscendC8AttentionBackendImpl,
+    _round_fia_seq_lens,
+    _update_fia_tail_mask,
 )
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     PagedAttentionGraphParam,
     cache_graph_workspace,
+    fia_graph_seq_len_bucket_size,
     needs_layer_aware_fia_graph_replay,
     using_paged_attention,
+    using_stable_fia_v2_graph_inputs,
     using_stable_paged_attention_graph_inputs,
 )
 from vllm_ascend.device.device_op import A5DeviceAdaptor
@@ -28,6 +32,38 @@ LARGE_HEAD_PREFILL_PATH = "vllm_ascend.device.utils.npu_large_head_prefill_atten
 
 
 class TestAttentionGraphHelpers(TestBase):
+    def test_fia_sequence_lengths_round_up_to_bucket(self):
+        self.assertEqual(_round_fia_seq_lens([1, 16, 17, 31], 16), [16, 16, 32, 32])
+
+    def test_fia_tail_mask_preserves_only_real_prefix(self):
+        mask = torch.empty((2, 1, 32), dtype=torch.bool)
+
+        _update_fia_tail_mask(mask, [3, 17])
+
+        self.assertFalse(mask[0, 0, :3].any())
+        self.assertTrue(mask[0, 0, 3:].all())
+        self.assertFalse(mask[1, 0, :17].any())
+        self.assertTrue(mask[1, 0, 17:].all())
+
+    @patch("vllm_ascend.attention.utils.get_ascend_config")
+    def test_fia_sequence_length_bucket_is_explicit_and_non_speculative(self, mock_get_config):
+        mock_get_config.return_value.fia_graph_seq_len_bucket_size = 16
+        config = MagicMock(speculative_config=None)
+        self.assertEqual(fia_graph_seq_len_bucket_size(config), 16)
+
+        config.speculative_config = MagicMock()
+        self.assertEqual(fia_graph_seq_len_bucket_size(config), 0)
+
+    @patch("vllm_ascend.attention.utils.using_paged_attention", return_value=False)
+    @patch("vllm_ascend.attention.utils.get_ascend_config")
+    def test_stable_fia_v2_requires_opt_in_and_non_speculative(self, mock_get_config, mock_using_pa):
+        mock_get_config.return_value.enable_stable_fia_v2_graph_inputs = True
+        config = MagicMock(speculative_config=None)
+        self.assertTrue(using_stable_fia_v2_graph_inputs(1, config))
+
+        config.speculative_config = MagicMock()
+        self.assertFalse(using_stable_fia_v2_graph_inputs(1, config))
+
     def test_cache_graph_workspace_keeps_first_workspace_by_default(self):
         graph_params = SimpleNamespace(workspaces={1: torch.empty(4)})
         candidate_workspace = torch.empty(8)
@@ -715,6 +751,90 @@ class TestAscendAttentionBackendImpl(TestBase):
         ]
         self.assertEqual(attn_module._ATTN_KEYS_BUFFER, expected)
         self.assertEqual(mock_fia.out.call_count, 3)
+
+    @patch("torch.npu.stream")
+    @patch("torch.npu.graph_task_update_begin")
+    @patch("torch_npu.npu_fused_infer_attention_score")
+    @patch("vllm_ascend.attention.attention_v1.get_graph_params")
+    @patch("vllm_ascend.attention.attention_v1._EXTRA_CTX")
+    @patch("vllm_ascend.attention.attention_v1.using_paged_attention", return_value=False)
+    @patch("vllm_ascend.attention.attention_v1.needs_layer_aware_fia_graph_replay", return_value=False)
+    @patch("vllm_ascend.attention.attention_v1.fia_graph_seq_len_bucket_size", return_value=16)
+    def test_fia_bucket_replay_signals_events_without_rebinding(
+        self,
+        mock_bucket_size,
+        mock_needs_layer_aware_fia_graph_replay,
+        mock_using_paged_attention,
+        mock_EXTRA_CTX,
+        mock_get_graph_params,
+        mock_fia,
+        mock_graph_task_update_begin,
+        mock_stream,
+    ):
+        mock_EXTRA_CTX.sinks = False
+        mock_EXTRA_CTX.is_draft_model = False
+
+        bucket_mask = torch.empty((1, 1, 32), dtype=torch.bool)
+        param: list[MagicMock | torch.Tensor | None] = [MagicMock()] * 21
+        param[4] = bucket_mask
+        param[16] = None
+        param[20] = None
+        events = [MagicMock(), MagicMock(), MagicMock()]
+        graph_params = mock_get_graph_params.return_value
+        graph_params.attn_params = {1: [tuple(param)] * 3}
+        graph_params.handles = {1: [MagicMock()] * 3}
+        graph_params.events = {1: events}
+        graph_params.workspaces = {1: MagicMock()}
+        graph_params.fia_bucket_keys = {1: (16,)}
+
+        key = "model.layers.0.self_attn.attn"
+        forward_context = MagicMock()
+        forward_context.attn_metadata = {key: MagicMock(seq_lens_list=[5])}
+
+        self.impl.update_graph_params(self.mock_stream, forward_context, 1, self.mock_vllm_config)
+
+        for event in events:
+            event.record.assert_called_once_with(self.mock_stream)
+        mock_graph_task_update_begin.assert_not_called()
+        mock_fia.out.assert_not_called()
+
+    @patch("torch.npu.stream")
+    @patch("torch.npu.graph_task_update_begin")
+    @patch("torch_npu.npu_fused_infer_attention_score_v2")
+    @patch("vllm_ascend.attention.attention_v1.get_graph_params")
+    @patch("vllm_ascend.attention.attention_v1._EXTRA_CTX")
+    @patch("vllm_ascend.attention.attention_v1.using_paged_attention", return_value=False)
+    @patch("vllm_ascend.attention.attention_v1.needs_layer_aware_fia_graph_replay", return_value=False)
+    @patch("vllm_ascend.attention.attention_v1.using_stable_fia_v2_graph_inputs", return_value=True)
+    def test_stable_fia_v2_signals_events_without_task_rebinding(
+        self,
+        mock_stable_fia_v2,
+        mock_needs_layer_aware_fia_graph_replay,
+        mock_using_paged_attention,
+        mock_EXTRA_CTX,
+        mock_get_graph_params,
+        mock_fia_v2,
+        mock_graph_task_update_begin,
+        mock_stream,
+    ):
+        mock_EXTRA_CTX.sinks = False
+        mock_EXTRA_CTX.is_draft_model = False
+        events = [MagicMock(), MagicMock()]
+        graph_params = mock_get_graph_params.return_value
+        graph_params.attn_params = {1: [(MagicMock(),), (MagicMock(),)]}
+        graph_params.handles = {1: [MagicMock(), MagicMock()]}
+        graph_params.events = {1: events}
+        graph_params.workspaces = {1: MagicMock()}
+
+        forward_context = MagicMock()
+        forward_context.attn_metadata = {"model.layers.0.self_attn.attn": MagicMock()}
+
+        self.impl.update_graph_params(self.mock_stream, forward_context, 1, self.mock_vllm_config)
+
+        for event in events:
+            event.record.assert_called_once_with(self.mock_stream)
+        mock_graph_task_update_begin.assert_not_called()
+        mock_fia_v2.out.assert_not_called()
 
     @patch("torch.npu.stream")
     @patch("torch.npu.graph_task_update_begin")

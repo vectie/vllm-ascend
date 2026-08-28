@@ -192,6 +192,33 @@ def using_stable_paged_attention_graph_inputs(runtime_shape: int, vllm_config: V
     )
 
 
+def fia_graph_seq_len_bucket_size(vllm_config: VllmConfig) -> int:
+    """Return the opt-in FIA decode sequence-length bucket size.
+
+    Keep the feature off for speculative decoding and PA: both paths have
+    different mask/task semantics.  A bucket of one is equivalent to the
+    ordinary per-token update and is therefore treated as disabled.
+    """
+
+    configured = getattr(get_ascend_config(), "fia_graph_seq_len_bucket_size", 0)
+    if not isinstance(configured, int):
+        return 0
+    bucket_size = configured
+    if bucket_size <= 1 or vllm_config.speculative_config is not None:
+        return 0
+    return bucket_size
+
+
+def using_stable_fia_v2_graph_inputs(runtime_shape: int, vllm_config: VllmConfig) -> bool:
+    """Use FIA-v2 with fixed-address device sequence lengths for decode graphs."""
+
+    if vllm_config.speculative_config is not None:
+        return False
+    if using_paged_attention(runtime_shape, vllm_config):
+        return False
+    return bool(getattr(get_ascend_config(), "enable_stable_fia_v2_graph_inputs", False))
+
+
 @lru_cache(maxsize=1)
 def enable_dcp():
     parallel_config = get_current_vllm_config().parallel_config

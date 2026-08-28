@@ -227,6 +227,19 @@ class AscendConfig:
         # inputs, so an opt-in deployment can replay the captured tasks directly
         # instead of rebuilding every attention-layer task each decode step.
         self.enable_stable_pa_graph_inputs = additional_config.get("enable_stable_pa_graph_inputs", False)
+        # FIA's list-valued sequence lengths normally require rebinding every
+        # captured attention task on every decode token.  The opt-in bucketed
+        # path keeps a fixed 3-D tail mask and only rebinds when a request
+        # crosses a sequence-length bucket.
+        self.fia_graph_seq_len_bucket_size = int(additional_config.get("fia_graph_seq_len_bucket_size", 0))
+        if self.fia_graph_seq_len_bucket_size < 0:
+            raise ValueError("fia_graph_seq_len_bucket_size must be non-negative")
+        # FIA-v2 accepts device tensors for dynamic sequence lengths.  With
+        # FULL_DECODE_ONLY's persistent model-runner buffers this removes host
+        # task rebinding without changing sparse mode or attention math.
+        self.enable_stable_fia_v2_graph_inputs = additional_config.get(
+            "enable_stable_fia_v2_graph_inputs", False
+        )
         # Weight NZ mode configuration.
         # 0: disabled, 1: only quant case enable nz (default), 2: BF16/FP16 also enable nz
         self.weight_nz_mode = self._get_config_value(

@@ -47,11 +47,13 @@ from vllm_ascend.attention.utils import (
     PagedAttentionGraphParam,
     cache_graph_workspace,
     enable_dcp,
+    fia_graph_seq_len_bucket_size,
     needs_layer_aware_fia_graph_replay,
     notify_kv_cache_written,
     split_decodes_and_prefills,
     update_paged_attention_graph_param,
     using_paged_attention,
+    using_stable_fia_v2_graph_inputs,
     using_stable_paged_attention_graph_inputs,
 )
 from vllm_ascend.compilation.acl_graph import (
@@ -68,6 +70,18 @@ from vllm_ascend.utils import is_950, weak_ref_tensors
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
 _ATTN_KEYS_BUFFER = None
+
+
+def _round_fia_seq_lens(seq_lens: list[int], bucket_size: int) -> list[int]:
+    return [cdiv(max(1, int(seq_len)), bucket_size) * bucket_size for seq_len in seq_lens]
+
+
+def _update_fia_tail_mask(mask: torch.Tensor, seq_lens: list[int]) -> None:
+    """Mask every physical KV slot at or after each request's real length."""
+
+    mask.fill_(True)
+    for row, seq_len in enumerate(seq_lens):
+        mask[row, 0, : int(seq_len)].fill_(False)
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -176,6 +190,9 @@ class AscendMetadata:
     # should simplified these parameters once attention schema in vLLM-Ascend
     # is unified.
     seq_lens: torch.Tensor = None
+    # Persistent model-runner NPU buffer. FIA-v2 can consume its changing
+    # values without replacing the captured task parameter.
+    device_seq_lens: torch.Tensor | None = None
     seq_lens_cpu: torch.Tensor = None
     seq_lens_list: list[int] = None  # type: ignore
     actual_seq_lengths_q: list[int] = None  # type: ignore
@@ -380,6 +397,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             block_tables=block_table,
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
+            device_seq_lens=common_attn_metadata.seq_lens[:num_reqs_fia],
             seq_lens_cpu=seq_lens,
             seq_lens_list=seq_lens_list,
             max_query_len=common_attn_metadata.max_query_len,
@@ -544,7 +562,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     )
                     torch.npu.graph_task_update_end(update_stream)
                     event.record(update_stream)
-        elif _EXTRA_CTX.sinks:
+        elif _EXTRA_CTX.sinks or using_stable_fia_v2_graph_inputs(num_tokens, vllm_config):
             # FIA update logic
             if _EXTRA_CTX.is_draft_model:
                 graph_params = get_draft_graph_params()
@@ -574,6 +592,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
             events = graph_params.events[num_tokens]
             graph_param_count = len(captured_attn_params)
             workspace = graph_params.workspaces.get(num_tokens)
+            if using_stable_fia_v2_graph_inputs(num_tokens, vllm_config) and not _EXTRA_CTX.sinks:
+                with torch.npu.stream(update_stream):
+                    for event in events:
+                        event.record(update_stream)
+                return
             if _EXTRA_CTX.is_draft_model:
                 if graph_param_count > len(draft_attn_key_steps):
                     repeat_count = cdiv(graph_param_count, len(draft_attn_key_steps))
@@ -723,6 +746,37 @@ class AscendAttentionBackendImpl(AttentionImpl):
             events = graph_params.events[num_tokens]
             graph_param_count = len(captured_attn_params)
             workspace = graph_params.workspaces.get(num_tokens)
+            bucket_size = fia_graph_seq_len_bucket_size(vllm_config)
+            if bucket_size and graph_param_count and not _EXTRA_CTX.is_draft_model:
+                first_param = captured_attn_params[0]
+                if not isinstance(first_param, PagedAttentionGraphParam):
+                    bucket_mask = first_param[4]
+                    first_key = attn_keys[0]
+                    first_layer_name = first_param[20]
+                    metadata_key = (
+                        first_layer_name
+                        if first_layer_name is not None and first_layer_name in attn_metadata
+                        else first_key
+                    )
+                    real_seq_lens = attn_metadata[metadata_key].seq_lens_list
+                    if bucket_mask is not None and bucket_mask.ndim == 3:
+                        bucket_key = tuple(_round_fia_seq_lens(real_seq_lens, bucket_size))
+                        # Replay has already enqueued its external-event waits
+                        # when this callback runs.  Produce the shared mask on
+                        # the update stream itself, before either task rebinding
+                        # or event signaling; waiting on the model stream here
+                        # would form a cycle with the captured graph.
+                        with torch.npu.stream(update_stream):
+                            _update_fia_tail_mask(bucket_mask, real_seq_lens)
+                        if graph_params.fia_bucket_keys.get(num_tokens) == bucket_key:
+                            # Each captured FIA group waits on its own external
+                            # event during every replay.  Re-signal those waits
+                            # even though no task parameter needs rebinding.
+                            with torch.npu.stream(update_stream):
+                                for event in events:
+                                    event.record(update_stream)
+                            return
+                        graph_params.fia_bucket_keys[num_tokens] = bucket_key
             if _EXTRA_CTX.is_draft_model:
                 if graph_param_count > len(draft_attn_key_steps):
                     repeat_count = cdiv(graph_param_count, len(draft_attn_key_steps))
@@ -811,6 +865,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         # block_tables from attn_metadata.
                         if not hasattr(vllm_config.model_config.hf_text_config, "sliding_window"):
                             block_tables = attn_metadata[metadata_key].block_tables
+                    if bucket_size and attn_mask is not None and attn_mask.ndim == 3:
+                        seq_lens = _round_fia_seq_lens(seq_lens, bucket_size)
                     layer_count += 1
 
                     torch.npu.graph_task_update_begin(update_stream, handle)
@@ -879,6 +935,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
         sparse_mode = 4 if self.sliding_window else 3 if attn_metadata.causal else 0
         pre_tokens = self.sliding_window or SWA_INT_MAX
         next_tokens = 0 if self.sliding_window else SWA_INT_MAX
+
+        bucket_size = fia_graph_seq_len_bucket_size(self.vllm_config)
+        if bucket_size and attn_metadata.causal and self.sliding_window is None and not _EXTRA_CTX.is_draft_model:
+            max_kv_slots = block_table.shape[1] * block_size
+            bucket_mask = graph_params.fia_bucket_masks.get(num_tokens)
+            expected_shape = (len(actual_seq_lengths_q), 1, max_kv_slots)
+            if bucket_mask is None or tuple(bucket_mask.shape) != expected_shape:
+                bucket_mask = torch.empty(expected_shape, dtype=torch.bool, device=query.device)
+                graph_params.fia_bucket_masks[num_tokens] = bucket_mask
+            _update_fia_tail_mask(bucket_mask, actual_seq_lengths_kv)
+            attn_mask = bucket_mask
+            actual_seq_lengths_kv = _round_fia_seq_lens(actual_seq_lengths_kv, bucket_size)
+            sparse_mode = 0
+            graph_params.fia_bucket_keys[num_tokens] = None
 
         extra_args = {}
         if self.enable_c8_quant and layer is not None:
@@ -1033,8 +1103,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ) -> torch.Tensor:
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
-        actual_seq_lengths_kv = attn_metadata.seq_lens
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        if using_stable_fia_v2_graph_inputs(num_tokens, self.vllm_config):
+            actual_seq_lengths_kv = attn_metadata.device_seq_lens
+        else:
+            actual_seq_lengths_kv = attn_metadata.seq_lens
+        # Workspace sizing is a capture-time host calculation in torch_npu.
+        # Passing the persistent NPU length tensor makes the helper extract a
+        # scalar and synchronize the captured stream.  The workspace only
+        # depends on the capture shape, so retain the CPU tensor for sizing and
+        # bind the device tensor exclusively to the captured FIA-v2 task.
+        workspace_seq_lengths_kv = attn_metadata.seq_lens
         if _EXTRA_CTX.is_draft_model:
             graph_params = get_draft_graph_params()
         else:
@@ -1057,7 +1136,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 input_layout="TND",
                 block_size=block_size,
                 actual_seq_qlen=actual_seq_lengths_q,
-                actual_seq_kvlen=actual_seq_lengths_kv,
+                actual_seq_kvlen=workspace_seq_lengths_kv,
                 num_key_value_heads=self.num_kv_heads,
                 softmax_scale=self.scale,
                 num_query_heads=self.num_heads,
@@ -1083,7 +1162,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 input_layout="TND",
                 block_size=block_size,
                 actual_seq_qlen=actual_seq_lengths_q,
-                actual_seq_kvlen=actual_seq_lengths_kv,
+                actual_seq_kvlen=workspace_seq_lengths_kv,
                 num_key_value_heads=self.num_kv_heads,
                 softmax_scale=self.scale,
                 num_query_heads=self.num_heads,
@@ -1292,7 +1371,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # runner v2, there is not capturing attribute in forward_context,
         # just use getattr to avoid attribute error.
         if _EXTRA_CTX.capturing:
-            if self.sinks is not None:
+            if self.sinks is not None or using_stable_fia_v2_graph_inputs(query.shape[0], self.vllm_config):
                 attn_output, num_tokens = self.full_graph_fia_v2(query, key, value, attn_metadata, output)
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output

@@ -5,7 +5,7 @@ import dataclasses
 import weakref
 from collections.abc import Callable
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import patch
 
@@ -302,6 +302,10 @@ class GraphParams:
     workspaces: dict[int, torch.Tensor]
     handles: dict[int, list[torch_npu._C._NPUTaskGroupHandle]]
     attn_params: dict[int, list[tuple]]
+    # Optional fixed-address FIA decode masks.  They are strong references on
+    # purpose: captured task parameters keep only weak tensor references.
+    fia_bucket_masks: dict[int, torch.Tensor] = field(default_factory=dict)
+    fia_bucket_keys: dict[int, tuple[int, ...] | None] = field(default_factory=dict)
 
 
 _graph_params: GraphParams | None = None

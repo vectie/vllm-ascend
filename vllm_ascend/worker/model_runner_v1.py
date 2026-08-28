@@ -439,6 +439,14 @@ class NPUModelRunner(GPUModelRunner):
             and _decode_metadata_cache.strip().lower()
             in {"1", "true", "yes", "on"}
         )
+        _decode_scalar_staging = get_c_env(
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_SCALAR_STAGING"
+        )
+        self._single_request_decode_scalar_staging_enabled = (
+            _decode_scalar_staging is not None
+            and _decode_scalar_staging.strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
         self._decode_metadata_device_signatures: dict[str, Any] = {}
 
         self._set_up_drafter()
@@ -864,6 +872,32 @@ class NPUModelRunner(GPUModelRunner):
             signatures[name] = signature
         return True
 
+    def _stage_single_request_decode_scalars(self) -> None:
+        """Stage the two dynamic batch-one decode scalars directly.
+
+        ``positions_np`` and ``optimistic_seq_lens_cpu`` already contain the
+        authoritative host values. Copying those values into their stable
+        graph-visible destinations avoids uploading ``num_computed_tokens``
+        and then launching gather, cast, add and full-tail fill kernels merely
+        to reconstruct two scalars on the device.
+
+        The seq-lens tail is initialized once per steady-decode residency
+        epoch. Any shape or execution-mode transition clears the shared
+        metadata signatures and restores the canonical preparation path.
+        """
+        self.positions[:1].copy_(
+            self._positions_cpu_buf[:1],
+            non_blocking=True,
+        )
+        self.seq_lens[:1].copy_(
+            self.optimistic_seq_lens_cpu[:1],
+            non_blocking=True,
+        )
+        signature = "single_request_decode_seq_lens_tail"
+        if self._decode_metadata_device_signatures.get(signature) is not True:
+            self.seq_lens[1:].fill_(0)
+            self._decode_metadata_device_signatures[signature] = True
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -917,6 +951,12 @@ class NPUModelRunner(GPUModelRunner):
             and not self.use_dcp
             and not self.use_async_spec_decode
             and not self._has_gdn
+        )
+        stage_single_request_decode_scalars = (
+            reuse_single_request_decode_metadata
+            and self._single_request_decode_scalar_staging_enabled
+            and not self.uses_mrope
+            and self.uses_xdrope_dim == 0
         )
         if not reuse_single_request_decode_metadata:
             self._decode_metadata_device_signatures.clear()
@@ -1170,7 +1210,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.prev_num_draft_tokens.gpu,
                 computed_token_tensor_cpu,
             )
-        else:
+        elif not stage_single_request_decode_scalars:
             self.num_computed_tokens[:num_reqs].copy_(
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
                 non_blocking=True,
@@ -1243,7 +1283,9 @@ class NPUModelRunner(GPUModelRunner):
                 positions_ready_on_device=False,
             )
 
-        if cp_async_rebuild.positions_ready_on_device:
+        if stage_single_request_decode_scalars:
+            self._stage_single_request_decode_scalars()
+        elif cp_async_rebuild.positions_ready_on_device:
             pass
         elif cp_async_rebuild.rebuilt:
             # The async rebuild computed corrected positions on CPU.
@@ -1261,10 +1303,11 @@ class NPUModelRunner(GPUModelRunner):
                 + self.query_pos.gpu[:total_num_scheduled_tokens]
             )
 
-        self.seq_lens[:num_reqs] = (
-            self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
-        )
-        self.seq_lens[num_reqs:].fill_(0)
+        if not stage_single_request_decode_scalars:
+            self.seq_lens[:num_reqs] = (
+                self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
+            )
+            self.seq_lens[num_reqs:].fill_(0)
 
         # In async spec decode mode, optimistic_seq_lens_cpu assumes all
         # tokens from the previous speculative step were accepted. Correct it

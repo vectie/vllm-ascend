@@ -883,6 +883,33 @@ class TestDecodeMetadataDeviceCache(unittest.TestCase):
         buffer.copy_to_gpu.assert_called_once_with()
         self.assertEqual(runner._decode_metadata_device_signatures, {})
 
+    def test_stages_dynamic_decode_scalars_and_initializes_tail_once(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.positions = torch.full((4,), -1, dtype=torch.int64)
+        runner.seq_lens = torch.full((4,), -1, dtype=torch.int32)
+        runner._positions_cpu_buf = torch.tensor(
+            [13, 0, 0, 0], dtype=torch.int64
+        )
+        runner.optimistic_seq_lens_cpu = torch.tensor(
+            [14, 0, 0, 0], dtype=torch.int32
+        )
+        runner._decode_metadata_device_signatures = {}
+
+        runner._stage_single_request_decode_scalars()
+
+        self.assertEqual(runner.positions.tolist(), [13, -1, -1, -1])
+        self.assertEqual(runner.seq_lens.tolist(), [14, 0, 0, 0])
+
+        # Only the active scalars change on a steady replay. The tail remains
+        # resident instead of receiving a full-slab fill every token.
+        runner._positions_cpu_buf[0] = 27
+        runner.optimistic_seq_lens_cpu[0] = 28
+        runner.seq_lens[1:].fill_(7)
+        runner._stage_single_request_decode_scalars()
+
+        self.assertEqual(runner.positions[0].item(), 27)
+        self.assertEqual(runner.seq_lens.tolist(), [28, 7, 7, 7])
+
 
 if __name__ == "__main__":
     unittest.main()

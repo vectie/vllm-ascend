@@ -586,6 +586,36 @@ class MultiGroupBlockTable:
             else:
                 block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
 
+    def try_prepare_single_token_decode_metadata(
+        self,
+        num_reqs: int,
+        num_computed_tokens: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> bool:
+        """Prepare shared scalars once, then update every non-Mamba KV group."""
+        attention_tables = [
+            table for table in self.block_tables if not table.is_mamba_group
+        ]
+        if not attention_tables:
+            return False
+
+        if not attention_tables[0].try_prepare_single_token_decode_metadata(
+            num_reqs,
+            num_computed_tokens,
+            positions,
+            seq_lens,
+        ):
+            return False
+
+        # Every KV group owns its own slot-mapping slab. The first fused
+        # program materializes the shared position/seq-len values and its slot;
+        # later groups consume that position on the same stream.
+        for table in attention_tables[1:]:
+            if not table._try_single_token_slot_fastpath(num_reqs, positions):
+                return False
+        return True
+
     def compute_slot_mapping_draft(
         self,
         req_indices: np.ndarray | torch.Tensor,

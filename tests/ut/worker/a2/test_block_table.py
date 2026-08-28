@@ -187,6 +187,39 @@ class TestBlockTableComputeSlotMapping(TestBase):
             )
         )
 
+    def test_multigroup_fuses_shared_scalars_and_updates_each_slot_slab(self):
+        from vllm_ascend.worker.block_table import MultiGroupBlockTable
+
+        first = MagicMock(is_mamba_group=False)
+        second = MagicMock(is_mamba_group=False)
+        mamba = MagicMock(is_mamba_group=True)
+        first.try_prepare_single_token_decode_metadata.return_value = True
+        second._try_single_token_slot_fastpath.return_value = True
+        block_tables = MultiGroupBlockTable.__new__(MultiGroupBlockTable)
+        block_tables.block_tables = [first, mamba, second]
+        num_computed_tokens = MagicMock()
+        positions = MagicMock()
+        seq_lens = MagicMock()
+
+        self.assertTrue(
+            block_tables.try_prepare_single_token_decode_metadata(
+                1,
+                num_computed_tokens,
+                positions,
+                seq_lens,
+            )
+        )
+        first.try_prepare_single_token_decode_metadata.assert_called_once_with(
+            1,
+            num_computed_tokens,
+            positions,
+            seq_lens,
+        )
+        second._try_single_token_slot_fastpath.assert_called_once_with(
+            1, positions
+        )
+        mamba._try_single_token_slot_fastpath.assert_not_called()
+
     def test_dirty_commit_uploads_only_after_row_changes(self):
         with patch.dict(
             "os.environ",

@@ -1,6 +1,9 @@
+import os
+
 import numpy as np
 import torch
 from vllm.distributed import get_dcp_group
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec, UniformTypeKVCacheSpecs
@@ -8,6 +11,35 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.block_table import _compute_slot_mapping_kernel
 
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
+
+_SINGLE_TOKEN_SLOT_GRAPH_ENV = "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH"
+
+
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name)
+    return value is not None and value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+@triton.jit
+def _compute_single_token_slot_mapping_kernel(
+    positions_ptr,
+    block_table_ptr,
+    block_size,
+    slot_mapping_ptr,
+    KV_CACHE_BLOCK_SIZE: tl.constexpr,
+    BLOCKS_PER_KV_BLOCK: tl.constexpr,
+):
+    """Map one decode position without a full-slab padding program."""
+    position = tl.load(positions_ptr)
+    physical_block_index = position // KV_CACHE_BLOCK_SIZE
+    physical_block_offset = position - physical_block_index * KV_CACHE_BLOCK_SIZE
+    logical_block_index = (
+        physical_block_index * BLOCKS_PER_KV_BLOCK
+        + physical_block_offset // block_size
+    )
+    block_number = tl.load(block_table_ptr + logical_block_index).to(tl.int64)
+    slot_offset = physical_block_offset % block_size
+    tl.store(slot_mapping_ptr, block_number * block_size + slot_offset)
 
 
 class BlockTable:
@@ -97,6 +129,42 @@ class BlockTable:
 
         self.kernel_sizes = kernel_sizes
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
+        self._single_token_slot_fastpath_enabled = _env_flag(_SINGLE_TOKEN_SLOT_GRAPH_ENV)
+
+    def _try_single_token_slot_fastpath(
+        self,
+        num_reqs: int,
+        positions: torch.Tensor,
+    ) -> bool:
+        """Avoid clearing the entire slot slab for batch-one decode.
+
+        The generic Triton kernel launches ``num_reqs + 1`` programs and pads
+        ``max_num_batched_tokens`` slots on every call. On Atlas A2 that means
+        rewriting an 8192-entry slab for each Talker token and costs roughly
+        188 us, even though a batch-one decode graph consumes only slot zero.
+
+        Use a scalar Triton kernel with the same hybrid-block arithmetic and
+        no padding program. This also avoids a nested NPUGraph boundary during
+        the runner's full-decode graph lifecycle.
+        """
+        if (
+            not self._single_token_slot_fastpath_enabled
+            or num_reqs != 1
+            or positions.numel() != 1
+            or positions.device.type != "npu"
+            or self.dcp_world_size != 1
+        ):
+            return False
+
+        _compute_single_token_slot_mapping_kernel[(1,)](
+            positions,
+            self.block_table.gpu,
+            self.block_size,
+            self.slot_mapping.gpu,
+            KV_CACHE_BLOCK_SIZE=self.physical_block_size,
+            BLOCKS_PER_KV_BLOCK=self.blocks_per_phys_block,
+        )
+        return True
 
     def append_row(
         self,
@@ -144,6 +212,9 @@ class BlockTable:
         query_start_loc: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
+        if self._try_single_token_slot_fastpath(num_reqs, positions):
+            return
+
         num_tokens = positions.shape[0]
         total_cp_world_size = self.dcp_world_size
         total_cp_rank = self.dcp_rank

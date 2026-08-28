@@ -77,6 +77,64 @@ class TestBlockTableComputeSlotMapping(TestBase):
             block_ids = list(range(i * 4, (i + 1) * 4))  # [0,1,2,3], [4,5,6,7], etc.
             block_table.add_row(block_ids, i)
 
+    def test_single_token_slot_graph_is_opt_in_and_npu_only(self):
+        with patch.dict(
+            "os.environ",
+            {"VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH": "1"},
+        ):
+            block_table = self.create_block_table(
+                dcp_world_size=1,
+                dcp_rank=0,
+                cp_kv_cache_interleave_size=1,
+            )
+
+        self.assertTrue(block_table._single_token_slot_fastpath_enabled)
+        self.assertFalse(
+            block_table._try_single_token_slot_fastpath(
+                num_reqs=1,
+                positions=torch.tensor([0], dtype=torch.int64),
+            )
+        )
+
+    def test_single_token_slot_graph_dispatches_only_batch_one_decode(self):
+        with patch.dict(
+            "os.environ",
+            {"VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH": "1"},
+        ):
+            block_table = self.create_block_table(
+                dcp_world_size=1,
+                dcp_rank=0,
+                cp_kv_cache_interleave_size=1,
+            )
+
+        positions = MagicMock()
+        positions.numel.return_value = 1
+        positions.device.type = "npu"
+        with patch(
+            "vllm_ascend.worker.block_table._compute_single_token_slot_mapping_kernel"
+        ) as kernel:
+            self.assertTrue(
+                block_table._try_single_token_slot_fastpath(
+                    num_reqs=1,
+                    positions=positions,
+                )
+            )
+            kernel.__getitem__.return_value.assert_called_once_with(
+                positions,
+                block_table.block_table.gpu,
+                block_table.block_size,
+                block_table.slot_mapping.gpu,
+                KV_CACHE_BLOCK_SIZE=block_table.physical_block_size,
+                BLOCKS_PER_KV_BLOCK=block_table.blocks_per_phys_block,
+            )
+
+        self.assertFalse(
+            block_table._try_single_token_slot_fastpath(
+                num_reqs=2,
+                positions=positions,
+            )
+        )
+
     def _test_slot_mapping_for_ranks(self, dcp_world_size, cp_kv_cache_interleave_size, test_configs):
         """Helper method to test slot_mapping across multiple ranks
 

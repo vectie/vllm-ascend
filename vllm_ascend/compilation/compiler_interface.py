@@ -146,6 +146,39 @@ def _configure_backend(
             )
 
 
+def _ensure_npugraph_weight_quant_view_option(config: Any) -> None:
+    """Repair torch_npu builds missing the weight-quant view safety option.
+
+    Some torch_npu 2.10 packages contain the weight-quant workaround in
+    ``npu_fx_compiler`` but omit ``enable_view_optimize`` from the matching
+    NPUGraph experimental config. The compiler then raises before lowering any
+    graph containing ``npu_weight_quant_batchmatmul``. Mirror the option from
+    torchair only when that packaged mismatch is present.
+    """
+    experimental_config = getattr(config, "experimental_config", None)
+    if experimental_config is None or hasattr(experimental_config, "enable_view_optimize"):
+        return
+
+    try:
+        from npugraph_ex.configs._option_base import OptionValue
+    except ImportError:
+        return
+
+    object.__setattr__(
+        experimental_config,
+        "enable_view_optimize",
+        OptionValue(True, [True, False]),
+    )
+    fixed_attrs = getattr(experimental_config, "_fixed_attrs", None)
+    if isinstance(fixed_attrs, list):
+        fixed_attrs.append("enable_view_optimize")
+    logger.warning_once(
+        "Patched missing NPUGraph enable_view_optimize option for "
+        "weight-quantized matmul compatibility.",
+        scope="global",
+    )
+
+
 def npugraph_ex_compile(
     graph: fx.GraphModule,
     example_inputs: list[Any],
@@ -172,6 +205,7 @@ def npugraph_ex_compile(
         _configure_backend(
             config, ascend_compilation_config, vllm_config, process_kwargs_options=_process_kwargs_options
         )
+        _ensure_npugraph_weight_quant_view_option(config)
         import npugraph_ex.npu_fx_compiler as nfx
 
         _original_get_compiled_gm = nfx._NpuFxCompiler._get_compiled_gm

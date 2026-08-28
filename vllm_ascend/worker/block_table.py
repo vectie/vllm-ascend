@@ -13,6 +13,7 @@ from vllm.v1.worker.block_table import _compute_slot_mapping_kernel
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
 
 _SINGLE_TOKEN_SLOT_GRAPH_ENV = "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH"
+_DIRTY_BLOCK_TABLE_COMMIT_ENV = "VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT"
 
 
 def _env_flag(name: str) -> bool:
@@ -130,6 +131,12 @@ class BlockTable:
         self.kernel_sizes = kernel_sizes
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
         self._single_token_slot_fastpath_enabled = _env_flag(_SINGLE_TOKEN_SLOT_GRAPH_ENV)
+        self._dirty_commit_enabled = _env_flag(_DIRTY_BLOCK_TABLE_COMMIT_ENV)
+        # The scheduler mutates rows much less often than the model runner
+        # consumes them.  Keep the device copy resident between allocation
+        # boundaries instead of retransmitting every active row per token.
+        # Start dirty so the first commit always initializes device memory.
+        self._dirty_rows = np.ones(max_num_reqs * duplicate_size, dtype=np.bool_)
 
     def _try_single_token_slot_fastpath(
         self,
@@ -182,6 +189,7 @@ class BlockTable:
 
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
         self.num_blocks_per_row[row_idx] += num_blocks
+        self._dirty_rows[row_idx] = True
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
@@ -192,11 +200,13 @@ class BlockTable:
         if num_blocks > 0:
             self.block_table.np[row_idx, :num_blocks] = 0
         self.num_blocks_per_row[row_idx] = 0
+        self._dirty_rows[row_idx] = True
 
     def move_row(self, src: int, tgt: int) -> None:
         num_blocks = self.num_blocks_per_row[src]
         self.block_table.np[tgt, :num_blocks] = self.block_table.np[src, :num_blocks]
         self.num_blocks_per_row[tgt] = num_blocks
+        self._dirty_rows[tgt] = True
 
     def swap_row(self, src: int, tgt: int) -> None:
         num_blocks_src = self.num_blocks_per_row[src]
@@ -205,6 +215,8 @@ class BlockTable:
         self.num_blocks_per_row[tgt] = num_blocks_src
 
         self.block_table.np[[src, tgt]] = self.block_table.np[[tgt, src]]
+        self._dirty_rows[src] = True
+        self._dirty_rows[tgt] = True
 
     def compute_slot_mapping(
         self,
@@ -347,11 +359,18 @@ class BlockTable:
             self.slot_mapping.cpu[: req_indices.shape[0]] = torch.where(mask, slot_mapping, -1)
 
     def commit_block_table(self, num_reqs: int) -> None:
+        if self._dirty_commit_enabled:
+            if not self._dirty_rows[:num_reqs].any():
+                return
+            self.block_table.copy_to_gpu(num_reqs)
+            self._dirty_rows[:num_reqs] = False
+            return
         self.block_table.copy_to_gpu(num_reqs)
 
     def clear(self) -> None:
         self.block_table.fill_(0)
         self.block_table.cpu.fill_(0)
+        self._dirty_rows.fill(False)
 
     def _convert_physical_to_logical_blocks(self, physical_blocks: np.ndarray) -> np.ndarray:
         """Convert physical block IDs to logical block IDs."""

@@ -135,6 +135,61 @@ class TestBlockTableComputeSlotMapping(TestBase):
             )
         )
 
+    def test_dirty_commit_uploads_only_after_row_changes(self):
+        with patch.dict(
+            "os.environ",
+            {"VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT": "1"},
+        ):
+            block_table = self.create_block_table(
+                dcp_world_size=1,
+                dcp_rank=0,
+                cp_kv_cache_interleave_size=1,
+            )
+
+        block_table.block_table.copy_to_gpu = MagicMock()
+        block_table.add_row([7, 8], 0)
+        block_table.commit_block_table(1)
+        block_table.commit_block_table(1)
+
+        block_table.block_table.copy_to_gpu.assert_called_once_with(1)
+
+        block_table.append_row([9], 0)
+        block_table.commit_block_table(1)
+        self.assertEqual(block_table.block_table.copy_to_gpu.call_count, 2)
+
+    def test_dirty_commit_tracks_move_swap_clear_and_inactive_rows(self):
+        with patch.dict(
+            "os.environ",
+            {"VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT": "1"},
+        ):
+            block_table = self.create_block_table(
+                dcp_world_size=1,
+                dcp_rank=0,
+                cp_kv_cache_interleave_size=1,
+            )
+
+        block_table.block_table.copy_to_gpu = MagicMock()
+        block_table.add_row([1], 0)
+        block_table.add_row([2], 1)
+        block_table.commit_block_table(2)
+
+        # A dirty inactive row must not force an active-prefix upload.
+        block_table.append_row([3], 2)
+        block_table.commit_block_table(2)
+        self.assertEqual(block_table.block_table.copy_to_gpu.call_count, 1)
+
+        block_table.move_row(0, 1)
+        block_table.commit_block_table(2)
+        block_table.swap_row(0, 1)
+        block_table.commit_block_table(2)
+        block_table.clear_row(0)
+        block_table.commit_block_table(2)
+        self.assertEqual(block_table.block_table.copy_to_gpu.call_count, 4)
+
+        block_table.clear()
+        block_table.commit_block_table(2)
+        self.assertEqual(block_table.block_table.copy_to_gpu.call_count, 4)
+
     def _test_slot_mapping_for_ranks(self, dcp_world_size, cp_kv_cache_interleave_size, test_configs):
         """Helper method to test slot_mapping across multiple ranks
 

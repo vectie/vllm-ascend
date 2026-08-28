@@ -55,10 +55,6 @@ class ACLGraphEntry:
     # for aclgraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: list[int] | None = None
-    # Optional precise completion event.  Waiting for this event before the
-    # next graph-task update preserves the host-side mutation barrier without
-    # synchronizing unrelated work subsequently queued on the model stream.
-    replay_completion_event: Any | None = None
 
 
 class ACLGraphWrapper:
@@ -95,8 +91,6 @@ class ACLGraphWrapper:
         *,
         use_eagle: bool = False,
         enable_enpu: bool = False,
-        update_stream: torch.npu.Stream | None = None,
-        enable_precise_replay_fence: bool = False,
     ):
         self.runnable = runnable
         self.vllm_config = vllm_config
@@ -120,10 +114,6 @@ class ACLGraphWrapper:
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
-        self.update_stream = update_stream
-        self.enable_precise_replay_fence = bool(
-            enable_precise_replay_fence and update_stream is not None
-        )
         _acl_graph_wrappers.add(self)
 
     def __getattr__(self, key: str):
@@ -272,30 +262,9 @@ class ACLGraphWrapper:
         is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
         current_stream = torch.npu.current_stream()
-        use_precise_replay_fence = (
-            not self.enable_enpu
-            and need_sync
-            and self.enable_precise_replay_fence
-        )
-        if use_precise_replay_fence:
-            if entry.replay_completion_event is None:
-                # Preserve the original barrier for the first replay, which
-                # can follow startup/capture work not represented by an entry
-                # completion event yet.
-                current_stream.synchronize()
-                entry.replay_completion_event = torch.npu.Event()
-            else:
-                # graph_task_update_begin/end mutate captured task metadata on
-                # the host immediately; a device-side wait on update_stream is
-                # therefore insufficient.  Synchronize only the point directly
-                # after the previous graph, not the entire current stream.
-                entry.replay_completion_event.synchronize()
-        elif not self.enable_enpu and need_sync:
+        if not self.enable_enpu and need_sync:
             current_stream.synchronize()
         entry.aclgraph.replay()
-        if use_precise_replay_fence:
-            assert entry.replay_completion_event is not None
-            entry.replay_completion_event.record(current_stream)
         return entry.output
 
 

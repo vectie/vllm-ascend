@@ -409,58 +409,6 @@ class TestACLGraphWrapper(TestBase):
         self.assertEqual(first_result, "test_output")  # Original output
         self.assertEqual(second_result, "weak_ref_output")  # Weak ref output
 
-    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
-    @patch("vllm_ascend.compilation.acl_graph.get_forward_context")
-    @patch("vllm_ascend.compilation.acl_graph.current_platform")
-    @patch("vllm_ascend.compilation.acl_graph.envs")
-    def test_precise_replay_fence_waits_only_for_graph_completion(
-        self,
-        mock_envs,
-        mock_current_platform,
-        mock_get_forward_context,
-        mock_get_forward_context_2,
-    ):
-        mock_envs.VLLM_LOGGING_LEVEL = "INFO"
-        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
-        mock_get_forward_context.return_value = self.mock_forward_context
-        mock_get_forward_context_2.return_value = self.mock_forward_context
-        self.mock_forward_context.cudagraph_runtime_mode = CUDAGraphMode.FULL
-
-        update_stream = MagicMock()
-        current_stream = MagicMock()
-        graph = MagicMock()
-        completion_event = MagicMock()
-        wrapper = ACLGraphWrapper(
-            runnable=self.mock_runnable,
-            vllm_config=self.mock_vllm_config,
-            runtime_mode=CUDAGraphMode.FULL,
-            cudagraph_options=self.mock_cudagraph_options,
-            update_stream=update_stream,
-            enable_precise_replay_fence=True,
-        )
-        wrapper.concrete_aclgraph_entries[self.mock_batch_descriptor] = ACLGraphEntry(
-            batch_descriptor=self.mock_batch_descriptor,
-            aclgraph=graph,
-            output="graph_output",
-        )
-
-        with (
-            patch("vllm_ascend.compilation.acl_graph.torch.npu.current_stream", return_value=current_stream),
-            patch("vllm_ascend.compilation.acl_graph.torch.npu.Event", return_value=completion_event),
-        ):
-            assert wrapper() == "graph_output"
-            current_stream.synchronize.assert_called_once_with()
-            completion_event.synchronize.assert_not_called()
-            completion_event.record.assert_called_once_with(current_stream)
-
-            assert wrapper() == "graph_output"
-
-        current_stream.synchronize.assert_called_once_with()
-        completion_event.synchronize.assert_called_once_with()
-        assert completion_event.record.call_count == 2
-        update_stream.wait_event.assert_not_called()
-        assert graph.replay.call_count == 2
-
     @patch("vllm_ascend.compilation.acl_graph.torch")
     @patch("vllm_ascend.compilation.acl_graph.validate_cudagraph_capturing_enabled")
     @patch("vllm_ascend.compilation.acl_graph.get_forward_context")

@@ -266,6 +266,19 @@ class AscendCompiler(CompilerInterface):
 
     name = "AscendCompiler"
 
+    @staticmethod
+    def _add_rms_norm_bias_cache_key() -> bool:
+        """Return the graph-visible AddRmsNormBias capability selection.
+
+        The environment gate is evaluated while Dynamo traces RMSNorm, so it
+        changes the operators stored in the persistent compile cache.  Include
+        the normalized value in the compiler hash to prevent an A2 process
+        that disables the optional ACLNN kernel from replaying a graph compiled
+        earlier on an A3-capable runtime (or with the default enabled).
+        """
+        raw = os.environ.get("VLLM_ASCEND_ENABLE_ADD_RMS_NORM_BIAS", "1")
+        return raw.strip().lower() not in {"0", "false", "off"}
+
     # TODO(wxs): add passes related to compilation in compute_hash
     def compute_hash(self, vllm_config: VllmConfig) -> str:
         self.vllm_config = vllm_config
@@ -278,6 +291,7 @@ class AscendCompiler(CompilerInterface):
             "torch_npu_version": torch_npu.__version__,
             "enable_npugraph_ex": ascend_compilation_config.enable_npugraph_ex,
             "enable_static_kernel": ascend_compilation_config.enable_static_kernel,
+            "enable_add_rms_norm_bias": self._add_rms_norm_bias_cache_key(),
         }
         logger.info("AscendCompiler hash factors: %s", factors)
         return sha256(str(factors).encode(), usedforsecurity=False).hexdigest()[:10]

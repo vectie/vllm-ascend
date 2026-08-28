@@ -122,6 +122,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Select the optional AddRmsNormBias ACLNN trace path.  This changes the
+    # captured graph and is also registered with vLLM's compile-factor table
+    # by the Ascend platform plugin so AOT artifacts cannot cross capability
+    # boundaries between A2 and A3 runtimes.
+    "VLLM_ASCEND_ENABLE_ADD_RMS_NORM_BIAS": lambda: os.getenv(
+        "VLLM_ASCEND_ENABLE_ADD_RMS_NORM_BIAS", "1"
+    ).strip().lower()
+    not in {"0", "false", "off"},
 }
 
 # end-env-vars-definition

@@ -15,8 +15,10 @@
 import inspect
 import os
 
+import vllm.envs as envs_vllm
 import vllm_ascend.envs as envs_ascend
 from tests.ut.base import TestBase
+from vllm_ascend.platform import _register_graph_semantic_env_factors
 
 
 class TestEnvVariables(TestBase):
@@ -57,3 +59,23 @@ class TestEnvVariables(TestBase):
         for var_name in self.env_vars:
             with self.subTest(var=var_name):
                 getattr(envs_ascend, var_name)
+
+    def test_graph_semantic_env_is_registered_for_vllm_aot_hash(self):
+        name = "VLLM_ASCEND_ENABLE_ADD_RMS_NORM_BIAS"
+        original_getter = envs_vllm.environment_variables.pop(name, None)
+        original_value = os.environ.get(name)
+        try:
+            _register_graph_semantic_env_factors()
+            os.environ[name] = "0"
+            self.assertFalse(envs_vllm.environment_variables[name]())
+            os.environ[name] = "1"
+            self.assertTrue(envs_vllm.environment_variables[name]())
+        finally:
+            if original_getter is None:
+                envs_vllm.environment_variables.pop(name, None)
+            else:
+                envs_vllm.environment_variables[name] = original_getter
+            if original_value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = original_value

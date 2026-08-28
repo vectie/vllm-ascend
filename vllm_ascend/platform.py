@@ -28,8 +28,19 @@ import vllm.envs as envs_vllm
 from vllm.logger import logger
 from vllm.platforms import Platform, PlatformEnum
 
+import vllm_ascend.envs as envs_ascend
+
 # todo: please remove it when solve cuda hard code in vllm
 os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
+
+
+def _register_graph_semantic_env_factors() -> None:
+    """Expose Ascend graph switches to vLLM's persistent AOT cache key."""
+    for name in ("VLLM_ASCEND_ENABLE_ADD_RMS_NORM_BIAS",):
+        envs_vllm.environment_variables.setdefault(name, envs_ascend.env_variables[name])
+
+
+_register_graph_semantic_env_factors()
 
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 

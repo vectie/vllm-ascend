@@ -447,12 +447,12 @@ class NPUModelRunner(GPUModelRunner):
             and _decode_scalar_staging.strip().lower()
             in {"1", "true", "yes", "on"}
         )
-        _async_replay_fence = get_c_env(
-            "VLLM_ASCEND_FULL_GRAPH_ASYNC_REPLAY_FENCE"
+        _precise_replay_fence = get_c_env(
+            "VLLM_ASCEND_FULL_GRAPH_PRECISE_REPLAY_FENCE"
         )
-        self._full_graph_async_replay_fence_enabled = (
-            _async_replay_fence is not None
-            and _async_replay_fence.strip().lower()
+        self._full_graph_precise_replay_fence_enabled = (
+            _precise_replay_fence is not None
+            and _precise_replay_fence.strip().lower()
             in {"1", "true", "yes", "on"}
         )
         self._decode_metadata_device_signatures: dict[str, Any] = {}
@@ -3696,8 +3696,8 @@ class NPUModelRunner(GPUModelRunner):
                 use_eagle=self.use_eagle,
                 enable_enpu=self.enable_enpu,
                 update_stream=self.update_stream,
-                enable_async_replay_fence=(
-                    self._full_graph_async_replay_fence_enabled
+                enable_precise_replay_fence=(
+                    self._full_graph_precise_replay_fence_enabled
                 ),
             )
 

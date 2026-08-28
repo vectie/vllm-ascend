@@ -413,7 +413,7 @@ class TestACLGraphWrapper(TestBase):
     @patch("vllm_ascend.compilation.acl_graph.get_forward_context")
     @patch("vllm_ascend.compilation.acl_graph.current_platform")
     @patch("vllm_ascend.compilation.acl_graph.envs")
-    def test_async_replay_fence_uses_ping_pong_events(
+    def test_precise_replay_fence_waits_only_for_graph_completion(
         self,
         mock_envs,
         mock_current_platform,
@@ -429,14 +429,14 @@ class TestACLGraphWrapper(TestBase):
         update_stream = MagicMock()
         current_stream = MagicMock()
         graph = MagicMock()
-        events = (MagicMock(), MagicMock())
+        completion_event = MagicMock()
         wrapper = ACLGraphWrapper(
             runnable=self.mock_runnable,
             vllm_config=self.mock_vllm_config,
             runtime_mode=CUDAGraphMode.FULL,
             cudagraph_options=self.mock_cudagraph_options,
             update_stream=update_stream,
-            enable_async_replay_fence=True,
+            enable_precise_replay_fence=True,
         )
         wrapper.concrete_aclgraph_entries[self.mock_batch_descriptor] = ACLGraphEntry(
             batch_descriptor=self.mock_batch_descriptor,
@@ -446,17 +446,19 @@ class TestACLGraphWrapper(TestBase):
 
         with (
             patch("vllm_ascend.compilation.acl_graph.torch.npu.current_stream", return_value=current_stream),
-            patch("vllm_ascend.compilation.acl_graph.torch.npu.Event", side_effect=events),
+            patch("vllm_ascend.compilation.acl_graph.torch.npu.Event", return_value=completion_event),
         ):
             assert wrapper() == "graph_output"
-            update_stream.wait_event.assert_not_called()
-            events[0].record.assert_called_once_with(current_stream)
+            current_stream.synchronize.assert_called_once_with()
+            completion_event.synchronize.assert_not_called()
+            completion_event.record.assert_called_once_with(current_stream)
 
             assert wrapper() == "graph_output"
 
-        current_stream.synchronize.assert_not_called()
-        update_stream.wait_event.assert_called_once_with(events[0])
-        events[1].record.assert_called_once_with(current_stream)
+        current_stream.synchronize.assert_called_once_with()
+        completion_event.synchronize.assert_called_once_with()
+        assert completion_event.record.call_count == 2
+        update_stream.wait_event.assert_not_called()
         assert graph.replay.call_count == 2
 
     @patch("vllm_ascend.compilation.acl_graph.torch")

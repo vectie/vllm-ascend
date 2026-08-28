@@ -48,6 +48,7 @@ from vllm_ascend.attention.utils import (
     PagedAttentionGraphParam,
     cache_graph_workspace,
     enable_dcp,
+    fia_bucket_graph_task_update_required,
     fia_graph_seq_len_bucket_size,
     needs_layer_aware_fia_graph_replay,
     notify_kv_cache_written,
@@ -94,6 +95,14 @@ def _update_fia_tail_mask(mask: torch.Tensor, seq_lens: list[int]) -> None:
     mask.fill_(True)
     for row, seq_len in enumerate(seq_lens):
         mask[row, 0, : int(seq_len)].fill_(False)
+
+
+def _fia_bucket_async_replay_enabled(vllm_config: VllmConfig) -> bool:
+    additional_config = getattr(vllm_config, "additional_config", None)
+    return bool(
+        isinstance(additional_config, dict)
+        and additional_config.get("enable_fia_bucket_async_replay") is True
+    )
 
 
 def _initialize_fia_tail_mask_outside_capture(mask: torch.Tensor, seq_lens: list[int]) -> None:
@@ -416,7 +425,11 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             block_tables=block_table,
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
-            device_seq_lens=common_attn_metadata.seq_lens[:num_reqs_fia],
+            device_seq_lens=(
+                common_attn_metadata.seq_lens[:num_reqs_fia]
+                if common_attn_metadata.seq_lens is not None
+                else None
+            ),
             seq_lens_cpu=seq_lens,
             seq_lens_list=seq_lens_list,
             max_query_len=common_attn_metadata.max_query_len,
@@ -509,6 +522,31 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # KV-sharing layers replay with the target layer's metadata instead of
         # their own module name, matching vLLM's shared KV-cache ownership.
         return self.kv_sharing_target_layer_name or layer_name
+
+    @staticmethod
+    def requires_full_graph_task_update(
+        forward_context,
+        num_tokens: int,
+        vllm_config: VllmConfig,
+        speculative_config=None,
+    ) -> bool:
+        """Return whether this replay will mutate captured FIA task metadata.
+
+        Bucketed batch-one decode can reuse every captured task while the
+        rounded sequence length and block-table addresses remain unchanged.
+        All unrecognized paths stay conservative so this predicate can safely
+        control the host replay barrier.
+        """
+
+        del speculative_config
+        return fia_bucket_graph_task_update_required(
+            forward_context,
+            num_tokens,
+            vllm_config,
+            get_graph_params(),
+            is_draft_model=bool(_EXTRA_CTX.is_draft_model),
+            sinks=bool(_EXTRA_CTX.sinks),
+        )
 
     @staticmethod
     def update_graph_params(
@@ -799,11 +837,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         # request and bucket.
                         bucket_key = _fia_bucket_reuse_key(real_seq_lens, bucket_size, current_block_tables)
                         # Replay has already enqueued its external-event waits
-                        # when this callback runs.  Produce the shared mask on
-                        # the update stream itself, before either task rebinding
-                        # or event signaling; waiting on the model stream here
-                        # would form a cycle with the captured graph.
+                        # when this callback runs. Produce the shared mask on
+                        # the update stream before task rebinding or signaling.
+                        # The optional completion event belongs to replay i-1,
+                        # so waiting for it cannot cycle with replay i.
                         with torch.npu.stream(update_stream):
+                            if _fia_bucket_async_replay_enabled(vllm_config):
+                                completion_event = getattr(
+                                    forward_context,
+                                    "aclgraph_previous_completion_event",
+                                    None,
+                                )
+                                if completion_event is not None:
+                                    completion_event.wait(update_stream)
                             _update_fia_tail_mask(bucket_mask, real_seq_lens)
                         if graph_params.fia_bucket_keys.get(num_tokens) == bucket_key:
                             # Each captured FIA group waits on its own external

@@ -200,13 +200,100 @@ def fia_graph_seq_len_bucket_size(vllm_config: VllmConfig) -> int:
     ordinary per-token update and is therefore treated as disabled.
     """
 
-    configured = getattr(get_ascend_config(), "fia_graph_seq_len_bucket_size", 0)
+    additional_config = getattr(vllm_config, "additional_config", None)
+    if isinstance(additional_config, dict) and "fia_graph_seq_len_bucket_size" in additional_config:
+        configured = additional_config["fia_graph_seq_len_bucket_size"]
+    else:
+        try:
+            configured = getattr(get_ascend_config(), "fia_graph_seq_len_bucket_size", 0)
+        except RuntimeError:
+            # Unit-level and third-party callers can build attention metadata
+            # before the platform singleton is initialized. That is a normal
+            # non-bucketed path, not a reason to make graph updates fail.
+            configured = 0
     if not isinstance(configured, int):
         return 0
     bucket_size = configured
     if bucket_size <= 1 or vllm_config.speculative_config is not None:
         return 0
     return bucket_size
+
+
+def fia_bucket_graph_task_update_required(
+    forward_context: ForwardContext,
+    num_tokens: int,
+    vllm_config: VllmConfig,
+    graph_params: Any,
+    *,
+    is_draft_model: bool,
+    sinks: bool,
+) -> bool:
+    """Conservatively detect whether bucketed FIA tasks need rebinding."""
+
+    additional_config = getattr(vllm_config, "additional_config", None)
+    if not (
+        isinstance(additional_config, dict)
+        and additional_config.get("enable_fia_bucket_async_replay") is True
+    ):
+        return True
+    bucket_size = fia_graph_seq_len_bucket_size(vllm_config)
+    if (
+        bucket_size <= 1
+        or vllm_config.speculative_config is not None
+        or is_draft_model
+        or sinks
+        or using_paged_attention(num_tokens, vllm_config)
+        or graph_params is None
+    ):
+        return True
+
+    captured_attn_params = graph_params.attn_params.get(num_tokens, [])
+    if not captured_attn_params:
+        return True
+    first_param = captured_attn_params[0]
+    if isinstance(first_param, PagedAttentionGraphParam):
+        return True
+    bucket_mask = first_param[4]
+    if bucket_mask is None or bucket_mask.ndim != 3:
+        return True
+
+    attn_metadata = forward_context.attn_metadata
+    attn_keys = [
+        key
+        for key in attn_metadata
+        if hasattr(attn_metadata[key], "seq_lens_list")
+    ]
+    if not attn_keys:
+        return True
+    first_layer_name = first_param[20]
+    metadata_key = (
+        first_layer_name
+        if first_layer_name is not None and first_layer_name in attn_metadata
+        else attn_keys[0]
+    )
+    real_seq_lens = attn_metadata[metadata_key].seq_lens_list
+    current_block_tables: list[torch.Tensor] = []
+    num_layers = len(attn_keys)
+    for index, captured_param in enumerate(captured_attn_params):
+        if isinstance(captured_param, PagedAttentionGraphParam):
+            return True
+        captured_layer_name = captured_param[20]
+        fallback_key = attn_keys[index % num_layers]
+        captured_metadata_key = (
+            captured_layer_name
+            if captured_layer_name is not None and captured_layer_name in attn_metadata
+            else fallback_key
+        )
+        current_block_tables.append(attn_metadata[captured_metadata_key].block_tables)
+
+    rounded_seq_lens = tuple(
+        ((max(1, int(seq_len)) + bucket_size - 1) // bucket_size) * bucket_size
+        for seq_len in real_seq_lens
+    )
+    bucket_key = rounded_seq_lens + tuple(
+        int(block_table.data_ptr()) for block_table in current_block_tables
+    )
+    return graph_params.fia_bucket_keys.get(num_tokens) != bucket_key
 
 
 def using_stable_fia_v2_graph_inputs(runtime_shape: int, vllm_config: VllmConfig) -> bool:

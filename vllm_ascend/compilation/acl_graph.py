@@ -21,6 +21,7 @@ from vllm.logger import logger
 from vllm.platforms import current_platform
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.attention.utils import fia_bucket_graph_task_update_required
 
 from ..utils import weak_ref_tensors
 
@@ -55,6 +56,11 @@ class ACLGraphEntry:
     # for aclgraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: list[int] | None = None
+    # Two completion events are alternated so the update stream can wait for
+    # replay i-1 while replay i is already queued behind its FIA release gates.
+    replay_completion_events: list[Any] = field(default_factory=list)
+    replay_completion_cursor: int = 0
+    replay_completion_valid: int = 0
 
 
 class ACLGraphWrapper:
@@ -114,6 +120,11 @@ class ACLGraphWrapper:
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
+        additional_config = getattr(vllm_config, "additional_config", None)
+        self.enable_fia_bucket_async_replay = bool(
+            isinstance(additional_config, dict)
+            and additional_config.get("enable_fia_bucket_async_replay") is True
+        )
         _acl_graph_wrappers.add(self)
 
     def __getattr__(self, key: str):
@@ -262,9 +273,49 @@ class ACLGraphWrapper:
         is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
         current_stream = torch.npu.current_stream()
-        if not self.enable_enpu and need_sync:
+        previous_completion_event = None
+        current_completion_event = None
+        if self.enable_fia_bucket_async_replay and need_sync:
+            if not entry.replay_completion_events:
+                entry.replay_completion_events = [torch.npu.Event(), torch.npu.Event()]
+            if entry.replay_completion_valid:
+                previous_completion_event = entry.replay_completion_events[
+                    (entry.replay_completion_cursor - 1) % len(entry.replay_completion_events)
+                ]
+            current_completion_event = entry.replay_completion_events[entry.replay_completion_cursor]
+            entry.replay_completion_cursor = (entry.replay_completion_cursor + 1) % len(
+                entry.replay_completion_events
+            )
+            entry.replay_completion_valid = min(
+                entry.replay_completion_valid + 1,
+                len(entry.replay_completion_events),
+            )
+        task_update_required = True
+        if self.enable_fia_bucket_async_replay and need_sync:
+            task_update_required = fia_bucket_graph_task_update_required(
+                forward_context,
+                batch_descriptor.num_tokens,
+                self.vllm_config,
+                get_graph_params(),
+                is_draft_model=bool(_EXTRA_CTX.is_draft_model),
+                sinks=bool(_EXTRA_CTX.sinks),
+            )
+        can_use_async_bucket_fence = (
+            self.enable_fia_bucket_async_replay
+            and need_sync
+            and not task_update_required
+            and previous_completion_event is not None
+        )
+        forward_context.aclgraph_previous_completion_event = (
+            previous_completion_event if can_use_async_bucket_fence else None
+        )
+        if not self.enable_enpu and need_sync and not can_use_async_bucket_fence:
             current_stream.synchronize()
+        elif can_use_async_bucket_fence:
+            logger.info_once("Replaying bucketed FIA graph without a host stream synchronize")
         entry.aclgraph.replay()
+        if current_completion_event is not None:
+            current_completion_event.record(current_stream)
         return entry.output
 
 

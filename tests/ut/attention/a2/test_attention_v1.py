@@ -826,6 +826,54 @@ class TestAscendAttentionBackendImpl(TestBase):
         mock_graph_task_update_begin.assert_not_called()
         mock_fia.out.assert_not_called()
 
+    @patch("vllm_ascend.attention.attention_v1.using_paged_attention", return_value=False)
+    @patch("vllm_ascend.attention.attention_v1.fia_graph_seq_len_bucket_size", return_value=16)
+    @patch("vllm_ascend.attention.attention_v1.get_graph_params")
+    @patch("vllm_ascend.attention.attention_v1._EXTRA_CTX")
+    def test_fia_bucket_preflight_skips_only_reused_task_metadata(
+        self,
+        mock_EXTRA_CTX,
+        mock_get_graph_params,
+        mock_bucket_size,
+        mock_using_paged_attention,
+    ):
+        mock_EXTRA_CTX.is_draft_model = False
+        mock_EXTRA_CTX.sinks = False
+        self.mock_vllm_config.additional_config = {
+            "enable_fia_bucket_async_replay": True,
+            "fia_graph_seq_len_bucket_size": 16,
+        }
+
+        bucket_mask = torch.empty((1, 1, 32), dtype=torch.bool)
+        block_table = torch.empty(4, dtype=torch.int32)
+        param: list[MagicMock | torch.Tensor | None] = [MagicMock()] * 21
+        param[4] = bucket_mask
+        param[20] = None
+        graph_params = mock_get_graph_params.return_value
+        graph_params.attn_params = {1: [tuple(param)] * 3}
+        graph_params.fia_bucket_keys = {1: _fia_bucket_reuse_key([5], 16, [block_table] * 3)}
+
+        key = "model.layers.0.self_attn.attn"
+        metadata = MagicMock(seq_lens_list=[5], block_tables=block_table)
+        forward_context = MagicMock(attn_metadata={key: metadata})
+        self.mock_vllm_config.speculative_config = None
+
+        self.assertFalse(
+            self.impl.requires_full_graph_task_update(
+                forward_context,
+                1,
+                self.mock_vllm_config,
+            )
+        )
+        metadata.seq_lens_list = [17]
+        self.assertTrue(
+            self.impl.requires_full_graph_task_update(
+                forward_context,
+                1,
+                self.mock_vllm_config,
+            )
+        )
+
     @patch("torch.npu.stream")
     @patch("torch.npu.graph_task_update_begin")
     @patch("torch_npu.npu_fused_infer_attention_score_v2")

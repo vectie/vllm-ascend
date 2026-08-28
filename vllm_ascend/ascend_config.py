@@ -234,6 +234,13 @@ class AscendConfig:
         self.fia_graph_seq_len_bucket_size = int(additional_config.get("fia_graph_seq_len_bucket_size", 0))
         if self.fia_graph_seq_len_bucket_size < 0:
             raise ValueError("fia_graph_seq_len_bucket_size must be non-negative")
+        # When a bucketed FIA replay does not need host-side task rebinding,
+        # allow the next FULL replay to be enqueued without a host stream
+        # synchronize.  The update stream waits for a ping-pong completion
+        # event before mutating the shared tail mask, preserving replay order.
+        self.enable_fia_bucket_async_replay = additional_config.get(
+            "enable_fia_bucket_async_replay", False
+        )
         # FIA-v2 accepts device tensors for dynamic sequence lengths.  With
         # FULL_DECODE_ONLY's persistent model-runner buffers this removes host
         # task rebinding without changing sparse mode or attention math.

@@ -410,6 +410,65 @@ class TestACLGraphWrapper(TestBase):
         self.assertEqual(second_result, "weak_ref_output")  # Weak ref output
 
     @patch("vllm_ascend.compilation.acl_graph.torch")
+    @patch(
+        "vllm_ascend.compilation.acl_graph.fia_bucket_graph_task_update_required",
+        side_effect=[False, False, True],
+    )
+    @patch("vllm_ascend.compilation.acl_graph.get_forward_context")
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    @patch("vllm_ascend.compilation.acl_graph.current_platform")
+    @patch("vllm_ascend.compilation.acl_graph.envs")
+    def test_fia_bucket_async_replay_uses_previous_completion_event(
+        self,
+        mock_envs,
+        mock_current_platform,
+        mock_get_forward_context,
+        mock_get_forward_context_2,
+        mock_task_update_required,
+        mock_torch,
+    ):
+        mock_envs.VLLM_LOGGING_LEVEL = "INFO"
+        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
+        mock_get_forward_context.return_value = self.mock_forward_context
+        mock_get_forward_context_2.return_value = self.mock_forward_context
+        self.mock_vllm_config.additional_config = {
+            "enable_fia_bucket_async_replay": True,
+        }
+
+        current_stream = mock_torch.npu.current_stream.return_value
+        first_completion = MagicMock()
+        second_completion = MagicMock()
+        mock_torch.npu.Event.side_effect = [first_completion, second_completion]
+
+        wrapper = ACLGraphWrapper(
+            runnable=self.mock_runnable,
+            vllm_config=self.mock_vllm_config,
+            runtime_mode=CUDAGraphMode.FULL,
+            cudagraph_options=self.mock_cudagraph_options,
+        )
+        graph = MagicMock()
+        wrapper.concrete_aclgraph_entries[self.mock_batch_descriptor] = ACLGraphEntry(
+            batch_descriptor=self.mock_batch_descriptor,
+            aclgraph=graph,
+            output="graph_output",
+        )
+
+        assert wrapper("arg") == "graph_output"
+        current_stream.synchronize.assert_called_once_with()
+        first_completion.record.assert_called_once_with(current_stream)
+        assert self.mock_forward_context.aclgraph_previous_completion_event is None
+
+        assert wrapper("arg") == "graph_output"
+        current_stream.synchronize.assert_called_once_with()
+        second_completion.record.assert_called_once_with(current_stream)
+        assert self.mock_forward_context.aclgraph_previous_completion_event is first_completion
+
+        assert wrapper("arg") == "graph_output"
+        assert current_stream.synchronize.call_count == 2
+        assert self.mock_forward_context.aclgraph_previous_completion_event is None
+        assert mock_task_update_required.call_count == 3
+
+    @patch("vllm_ascend.compilation.acl_graph.torch")
     @patch("vllm_ascend.compilation.acl_graph.validate_cudagraph_capturing_enabled")
     @patch("vllm_ascend.compilation.acl_graph.get_forward_context")
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")

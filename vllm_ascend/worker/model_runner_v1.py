@@ -1210,7 +1210,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.prev_num_draft_tokens.gpu,
                 computed_token_tensor_cpu,
             )
-        elif not stage_single_request_decode_scalars:
+        else:
             self.num_computed_tokens[:num_reqs].copy_(
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
                 non_blocking=True,
@@ -1283,7 +1283,23 @@ class NPUModelRunner(GPUModelRunner):
                 positions_ready_on_device=False,
             )
 
-        if stage_single_request_decode_scalars:
+        block_table = self.input_batch.block_table
+        fused_single_request_decode_metadata = (
+            stage_single_request_decode_scalars
+            and block_table.try_prepare_single_token_decode_metadata(
+                num_reqs,
+                self.num_computed_tokens[:num_reqs],
+                self.positions[:total_num_scheduled_tokens],
+                self.seq_lens[:num_reqs],
+            )
+        )
+
+        if fused_single_request_decode_metadata:
+            signature = "single_request_decode_seq_lens_tail"
+            if self._decode_metadata_device_signatures.get(signature) is not True:
+                self.seq_lens[num_reqs:].fill_(0)
+                self._decode_metadata_device_signatures[signature] = True
+        elif stage_single_request_decode_scalars:
             self._stage_single_request_decode_scalars()
         elif cp_async_rebuild.positions_ready_on_device:
             pass
@@ -1323,11 +1339,12 @@ class NPUModelRunner(GPUModelRunner):
         if self._needs_seq_lens_cpu_sync and async_spec_decode_active:
             self._correct_optimistic_seq_lens_cpu(num_reqs)
 
-        self.input_batch.block_table.compute_slot_mapping(
-            num_reqs,
-            self.query_start_loc.gpu[: num_reqs + 1],
-            self.positions[:total_num_scheduled_tokens],
-        )
+        if not fused_single_request_decode_metadata:
+            self.input_batch.block_table.compute_slot_mapping(
+                num_reqs,
+                self.query_start_loc.gpu[: num_reqs + 1],
+                self.positions[:total_num_scheduled_tokens],
+            )
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
             drift = self.num_computed_tokens[req_indices_gpu].to(

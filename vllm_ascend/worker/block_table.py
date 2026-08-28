@@ -43,6 +43,33 @@ def _compute_single_token_slot_mapping_kernel(
     tl.store(slot_mapping_ptr, block_number * block_size + slot_offset)
 
 
+@triton.jit
+def _prepare_single_token_decode_metadata_kernel(
+    num_computed_tokens_ptr,
+    positions_ptr,
+    seq_lens_ptr,
+    block_table_ptr,
+    block_size,
+    slot_mapping_ptr,
+    KV_CACHE_BLOCK_SIZE: tl.constexpr,
+    BLOCKS_PER_KV_BLOCK: tl.constexpr,
+):
+    """Prepare all dynamic batch-one decode scalars in one device program."""
+    position = tl.load(num_computed_tokens_ptr)
+    tl.store(positions_ptr, position)
+    tl.store(seq_lens_ptr, position + 1)
+
+    physical_block_index = position // KV_CACHE_BLOCK_SIZE
+    physical_block_offset = position - physical_block_index * KV_CACHE_BLOCK_SIZE
+    logical_block_index = (
+        physical_block_index * BLOCKS_PER_KV_BLOCK
+        + physical_block_offset // block_size
+    )
+    block_number = tl.load(block_table_ptr + logical_block_index).to(tl.int64)
+    slot_offset = physical_block_offset % block_size
+    tl.store(slot_mapping_ptr, block_number * block_size + slot_offset)
+
+
 class BlockTable:
     def __init__(
         self,
@@ -165,6 +192,45 @@ class BlockTable:
 
         _compute_single_token_slot_mapping_kernel[(1,)](
             positions,
+            self.block_table.gpu,
+            self.block_size,
+            self.slot_mapping.gpu,
+            KV_CACHE_BLOCK_SIZE=self.physical_block_size,
+            BLOCKS_PER_KV_BLOCK=self.blocks_per_phys_block,
+        )
+        return True
+
+    def try_prepare_single_token_decode_metadata(
+        self,
+        num_reqs: int,
+        num_computed_tokens: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> bool:
+        """Fuse position, seq-len and slot preparation for batch-one decode.
+
+        The runner has already uploaded the one authoritative dynamic scalar,
+        ``num_computed_tokens``. Reconstructing position and sequence length
+        with separate gather/cast/add programs before launching the scalar
+        slot-mapping kernel adds avoidable dispatch latency on Atlas A2.
+        """
+        if (
+            not self._single_token_slot_fastpath_enabled
+            or num_reqs != 1
+            or num_computed_tokens.numel() != 1
+            or positions.numel() != 1
+            or seq_lens.numel() != 1
+            or num_computed_tokens.device.type != "npu"
+            or positions.device.type != "npu"
+            or seq_lens.device.type != "npu"
+            or self.dcp_world_size != 1
+        ):
+            return False
+
+        _prepare_single_token_decode_metadata_kernel[(1,)](
+            num_computed_tokens,
+            positions,
+            seq_lens,
             self.block_table.gpu,
             self.block_size,
             self.slot_mapping.gpu,

@@ -135,6 +135,58 @@ class TestBlockTableComputeSlotMapping(TestBase):
             )
         )
 
+    def test_single_token_decode_metadata_fuses_three_outputs(self):
+        with patch.dict(
+            "os.environ",
+            {"VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH": "1"},
+        ):
+            block_table = self.create_block_table(
+                dcp_world_size=1,
+                dcp_rank=0,
+                cp_kv_cache_interleave_size=1,
+            )
+
+        def npu_scalar():
+            value = MagicMock()
+            value.numel.return_value = 1
+            value.device.type = "npu"
+            return value
+
+        num_computed_tokens = npu_scalar()
+        positions = npu_scalar()
+        seq_lens = npu_scalar()
+        with patch(
+            "vllm_ascend.worker.block_table."
+            "_prepare_single_token_decode_metadata_kernel"
+        ) as kernel:
+            self.assertTrue(
+                block_table.try_prepare_single_token_decode_metadata(
+                    num_reqs=1,
+                    num_computed_tokens=num_computed_tokens,
+                    positions=positions,
+                    seq_lens=seq_lens,
+                )
+            )
+            kernel.__getitem__.return_value.assert_called_once_with(
+                num_computed_tokens,
+                positions,
+                seq_lens,
+                block_table.block_table.gpu,
+                block_table.block_size,
+                block_table.slot_mapping.gpu,
+                KV_CACHE_BLOCK_SIZE=block_table.physical_block_size,
+                BLOCKS_PER_KV_BLOCK=block_table.blocks_per_phys_block,
+            )
+
+        self.assertFalse(
+            block_table.try_prepare_single_token_decode_metadata(
+                num_reqs=2,
+                num_computed_tokens=num_computed_tokens,
+                positions=positions,
+                seq_lens=seq_lens,
+            )
+        )
+
     def test_dirty_commit_uploads_only_after_row_changes(self):
         with patch.dict(
             "os.environ",

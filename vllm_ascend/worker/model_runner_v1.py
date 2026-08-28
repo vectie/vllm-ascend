@@ -431,6 +431,16 @@ class NPUModelRunner(GPUModelRunner):
         _enpu = get_c_env("ENPU_ENABLE")
         self.enable_enpu = _enpu is not None and _enpu.lower() == "true"
 
+        _decode_metadata_cache = get_c_env(
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE"
+        )
+        self._single_request_decode_metadata_cache_enabled = (
+            _decode_metadata_cache is not None
+            and _decode_metadata_cache.strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self._decode_metadata_device_signatures: dict[str, Any] = {}
+
         self._set_up_drafter()
 
         # Backends that consume CPU seq_lens (AscendAttentionBackend,
@@ -816,6 +826,44 @@ class NPUModelRunner(GPUModelRunner):
 
         return num_reqs_padded
 
+    def _copy_decode_metadata_if_changed(
+        self,
+        name: str,
+        buffer: Any,
+        count: int | None,
+        signature: Any,
+        reuse_enabled: bool,
+    ) -> bool:
+        """Upload a runner metadata slab only when its device value changed.
+
+        Batch-one autoregressive decode repeatedly presents identical values
+        for query offsets, request indices and one-token schedule lengths.
+        Their ``CpuGpuBuffer`` objects already have stable addresses for graph
+        replay, so retransmitting them only adds tiny H2D copies, copy events
+        and host dispatch work. Non-steady shapes invalidate the cache and use
+        the canonical upload path.
+
+        Returns ``True`` when an upload was issued, which keeps the helper easy
+        to validate without an NPU.
+        """
+        signatures = getattr(self, "_decode_metadata_device_signatures", None)
+        if signatures is None:
+            signatures = {}
+            self._decode_metadata_device_signatures = signatures
+
+        if not reuse_enabled:
+            signatures.clear()
+        elif signatures.get(name) == signature:
+            return False
+
+        if count is None:
+            buffer.copy_to_gpu()
+        else:
+            buffer.copy_to_gpu(count)
+        if reuse_enabled:
+            signatures[name] = signature
+        return True
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -860,6 +908,18 @@ class NPUModelRunner(GPUModelRunner):
         # Determine if it's a splitfuse batch
         with_prefill = attn_state not in [AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding]
         self.with_prefill = with_prefill
+        reuse_single_request_decode_metadata = (
+            self._single_request_decode_metadata_cache_enabled
+            and num_reqs == 1
+            and total_num_scheduled_tokens == 1
+            and not with_prefill
+            and not scheduler_output.scheduled_spec_decode_tokens
+            and not self.use_dcp
+            and not self.use_async_spec_decode
+            and not self._has_gdn
+        )
+        if not reuse_single_request_decode_metadata:
+            self._decode_metadata_device_signatures.clear()
 
         # Get positions.
         cu_num_tokens = self._get_cumsum_and_arange(
@@ -972,7 +1032,16 @@ class NPUModelRunner(GPUModelRunner):
 
         self.query_start_loc.np[0] = 0
         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
-        self.query_start_loc.copy_to_gpu()
+        # Keep padding canonical on the host so its existing H2D upload also
+        # initializes the tail. This removes a separate full-slab NPU fill.
+        self.query_start_loc.np[num_reqs + 1 :].fill(-1)
+        self._copy_decode_metadata_if_changed(
+            "query_start_loc",
+            self.query_start_loc,
+            None,
+            (num_reqs, total_num_scheduled_tokens),
+            reuse_single_request_decode_metadata,
+        )
 
         # Now, query_start_loc is padded.
         # But gdn needs an unpadded one.
@@ -995,9 +1064,6 @@ class NPUModelRunner(GPUModelRunner):
             out=self.optimistic_seq_lens_cpu[:num_reqs],
         )
         self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
-
-        # Fill unused with -1. Needed for reshape_and_cache in attention_cp
-        self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
 
         # Copy the tensors to the NPU.
         self._prepare_input_ids(scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens)
@@ -1032,7 +1098,13 @@ class NPUModelRunner(GPUModelRunner):
         self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
         
         self.discard_request_mask.np[:num_reqs] = discard_requests_mask
-        self.discard_request_mask.copy_to_gpu(num_reqs)
+        self._copy_decode_metadata_if_changed(
+            "discard_request_mask",
+            self.discard_request_mask,
+            num_reqs,
+            tuple(bool(value) for value in discard_requests_mask),
+            reuse_single_request_decode_metadata,
+        )
 
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
@@ -1060,7 +1132,18 @@ class NPUModelRunner(GPUModelRunner):
             self.num_accepted_tokens.copy_to_gpu()
         else:
             self.num_accepted_tokens.np.fill(1)
-            self.num_accepted_tokens.gpu.fill_(1)
+            if (
+                not reuse_single_request_decode_metadata
+                or self._decode_metadata_device_signatures.get(
+                    "num_accepted_tokens"
+                )
+                != 1
+            ):
+                self.num_accepted_tokens.gpu.fill_(1)
+                if reuse_single_request_decode_metadata:
+                    self._decode_metadata_device_signatures[
+                        "num_accepted_tokens"
+                    ] = 1
 
         # Update num_computed_tokens on GPU. In async spec decode,
         # CPU values are optimistic (all drafts accepted). The kernel
@@ -1094,12 +1177,30 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
-        self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
+        self._copy_decode_metadata_if_changed(
+            "req_indices",
+            self.req_indices,
+            total_num_scheduled_tokens,
+            (num_reqs, total_num_scheduled_tokens),
+            reuse_single_request_decode_metadata,
+        )
         req_indices_gpu = self.req_indices.gpu[:total_num_scheduled_tokens]
 
-        self.query_pos.copy_to_gpu(total_num_scheduled_tokens)
+        self._copy_decode_metadata_if_changed(
+            "query_pos",
+            self.query_pos,
+            total_num_scheduled_tokens,
+            (num_reqs, total_num_scheduled_tokens),
+            reuse_single_request_decode_metadata,
+        )
         self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
-        self.num_scheduled_tokens.copy_to_gpu(num_reqs)
+        self._copy_decode_metadata_if_changed(
+            "num_scheduled_tokens",
+            self.num_scheduled_tokens,
+            num_reqs,
+            (num_reqs, total_num_scheduled_tokens),
+            reuse_single_request_decode_metadata,
+        )
         num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
 
         dcp_manager = getattr(self, "dcp_manager", None)

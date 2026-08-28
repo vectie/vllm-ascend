@@ -842,5 +842,47 @@ class TestCorrectOptimisticSeqLensCpu(unittest.TestCase):
             runner._correct_optimistic_seq_lens_cpu(1)
 
 
+class TestDecodeMetadataDeviceCache(unittest.TestCase):
+    def test_reuses_unchanged_metadata_and_uploads_changed_signature(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner._decode_metadata_device_signatures = {}
+        buffer = MagicMock()
+
+        self.assertTrue(
+            runner._copy_decode_metadata_if_changed(
+                "query_pos", buffer, 1, (1, 1), True
+            )
+        )
+        self.assertFalse(
+            runner._copy_decode_metadata_if_changed(
+                "query_pos", buffer, 1, (1, 1), True
+            )
+        )
+        self.assertTrue(
+            runner._copy_decode_metadata_if_changed(
+                "query_pos", buffer, 2, (1, 2), True
+            )
+        )
+
+        self.assertEqual(buffer.copy_to_gpu.call_args_list, [call(1), call(2)])
+
+    def test_nonsteady_path_invalidates_all_cached_metadata(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner._decode_metadata_device_signatures = {
+            "query_pos": (1, 1),
+            "req_indices": (1, 1),
+        }
+        buffer = MagicMock()
+
+        self.assertTrue(
+            runner._copy_decode_metadata_if_changed(
+                "query_pos", buffer, None, (1, 1), False
+            )
+        )
+
+        buffer.copy_to_gpu.assert_called_once_with()
+        self.assertEqual(runner._decode_metadata_device_signatures, {})
+
+
 if __name__ == "__main__":
     unittest.main()

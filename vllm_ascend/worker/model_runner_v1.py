@@ -447,6 +447,14 @@ class NPUModelRunner(GPUModelRunner):
             and _decode_scalar_staging.strip().lower()
             in {"1", "true", "yes", "on"}
         )
+        _async_replay_fence = get_c_env(
+            "VLLM_ASCEND_FULL_GRAPH_ASYNC_REPLAY_FENCE"
+        )
+        self._full_graph_async_replay_fence_enabled = (
+            _async_replay_fence is not None
+            and _async_replay_fence.strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
         self._decode_metadata_device_signatures: dict[str, Any] = {}
 
         self._set_up_drafter()
@@ -3687,6 +3695,10 @@ class NPUModelRunner(GPUModelRunner):
                 runtime_mode=CUDAGraphMode.FULL,
                 use_eagle=self.use_eagle,
                 enable_enpu=self.enable_enpu,
+                update_stream=self.update_stream,
+                enable_async_replay_fence=(
+                    self._full_graph_async_replay_fence_enabled
+                ),
             )
 
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:

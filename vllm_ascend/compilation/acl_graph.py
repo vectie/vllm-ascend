@@ -55,6 +55,11 @@ class ACLGraphEntry:
     # for aclgraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: list[int] | None = None
+    # Optional ping-pong events for replacing the per-replay host stream
+    # synchronization with a device-side dependency. ``replay_fence_index``
+    # identifies the event recorded after the previous replay.
+    replay_fence_events: tuple[Any, Any] | None = None
+    replay_fence_index: int = -1
 
 
 class ACLGraphWrapper:
@@ -91,6 +96,8 @@ class ACLGraphWrapper:
         *,
         use_eagle: bool = False,
         enable_enpu: bool = False,
+        update_stream: torch.npu.Stream | None = None,
+        enable_async_replay_fence: bool = False,
     ):
         self.runnable = runnable
         self.vllm_config = vllm_config
@@ -114,6 +121,10 @@ class ACLGraphWrapper:
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
+        self.update_stream = update_stream
+        self.enable_async_replay_fence = bool(
+            enable_async_replay_fence and update_stream is not None
+        )
         _acl_graph_wrappers.add(self)
 
     def __getattr__(self, key: str):
@@ -261,9 +272,29 @@ class ACLGraphWrapper:
         # When FULL + EAGLE draft (merge path), replay does not need this barrier.
         is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
-        if not self.enable_enpu and need_sync:
-            torch.npu.current_stream().synchronize()
+        current_stream = torch.npu.current_stream()
+        use_async_replay_fence = (
+            not self.enable_enpu
+            and need_sync
+            and self.enable_async_replay_fence
+        )
+        if use_async_replay_fence:
+            assert self.update_stream is not None
+            if entry.replay_fence_events is None:
+                entry.replay_fence_events = (torch.npu.Event(), torch.npu.Event())
+            if entry.replay_fence_index >= 0:
+                self.update_stream.wait_event(
+                    entry.replay_fence_events[entry.replay_fence_index]
+                )
+        elif not self.enable_enpu and need_sync:
+            current_stream.synchronize()
         entry.aclgraph.replay()
+        if use_async_replay_fence:
+            assert entry.replay_fence_events is not None
+            entry.replay_fence_index = (entry.replay_fence_index + 1) % 2
+            entry.replay_fence_events[entry.replay_fence_index].record(
+                current_stream
+            )
         return entry.output
 
 

@@ -18,6 +18,7 @@ MIN_CPUS_PER_NPU_WITHOUT_IRQ = 3  # 1(main, at least 1 CPU) + 1(acl) + 1(release
 ASCEND_950_PHYSICAL_CPUS_PER_CLUSTER = 8
 ALLOWED_CPUS_PATH = "/proc/self/status"
 ASCEND_RT_VISIBLE_DEVICES = os.getenv("ASCEND_RT_VISIBLE_DEVICES")
+STAGE_SLICE_ENV = "VLLM_ASCEND_CPU_BINDING_STAGE_SLICE"
 
 TOPO_AFFINITY_MODE = "topo_affinity"
 GLOBAL_SLICE_MODE = "global_slice"
@@ -200,7 +201,27 @@ class DeviceInfo:
                     continue
                 last_part = parts[-1]
                 if self.is_cpu_list(last_part):
-                    affinity[int(npu_match.group(1))] = self.expand_cpu_list(last_part)
+                    physical_npu_id = npu_match.group(1)
+                    affinity_id = int(physical_npu_id)
+
+                    # On A2, the topology table is keyed by the host's physical
+                    # NPU ID while worker discovery and
+                    # ASCEND_RT_VISIBLE_DEVICES use container-visible logical
+                    # IDs.  A remapped container can therefore expose physical
+                    # NPU3 as logical NPU0.  Normalize the single-chip A2 row to
+                    # the same logical namespace used by running_npu_list.
+                    #
+                    # A3 board rows contain multiple chips and cannot be
+                    # resolved without a chip column, so preserve the topology
+                    # ID there.  A3 uses global-slice binding rather than this
+                    # per-NPU affinity map.
+                    chip_map = getattr(self, "npu_map_info", {}).get(physical_npu_id, {})
+                    if len(chip_map) == 1:
+                        logic_id = next(iter(chip_map.values()))
+                        if logic_id.isdigit():
+                            affinity_id = int(logic_id)
+
+                    affinity[affinity_id] = self.expand_cpu_list(last_part)
         return affinity
 
 
@@ -215,6 +236,77 @@ class CpuAlloc:
         self.assign_acl: dict[int, list[int]] = {}
         self.assign_rel: dict[int, list[int]] = {}
         self.uvb_cpu_pool: list[int] = []
+        self.stage_slice = self.parse_stage_slice(os.getenv(STAGE_SLICE_ENV))
+
+    @staticmethod
+    def parse_stage_slice(value: str | None) -> tuple[int, tuple[int, ...]] | None:
+        """Parse ``index:weight,weight,...`` for co-located stage workers."""
+        if value is None or not value.strip():
+            return None
+        try:
+            index_raw, weights_raw = value.split(":", 1)
+            index = int(index_raw)
+            weights = tuple(int(item) for item in weights_raw.split(","))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid {STAGE_SLICE_ENV}={value!r}; expected index:weight,weight,..."
+            ) from exc
+        if not weights or any(weight <= 0 for weight in weights):
+            raise ValueError(f"Invalid {STAGE_SLICE_ENV}={value!r}; weights must be positive")
+        if index < 0 or index >= len(weights):
+            raise ValueError(
+                f"Invalid {STAGE_SLICE_ENV}={value!r}; index must select one weight"
+            )
+        return index, weights
+
+    def partition_cpu_pool_for_stage(self) -> None:
+        """Give co-located stage workers disjoint, weighted CPU slices.
+
+        vLLM-Omni can run Thinker, Talker and Code2Wav as separate processes on
+        one NPU. Ordinary per-NPU binding assigns all three the same CPUs. This
+        optional subdivision keeps NUMA locality while preventing those hot
+        processes from migrating across, or contending for, the same cores.
+        """
+        stage_slice = getattr(self, "stage_slice", None)
+        if stage_slice is None:
+            return
+        index, weights = stage_slice
+        total_weight = sum(weights)
+        # Allocate the largest stage first. On A2 the NPU affinity mask can
+        # cover two adjacent NUMA nodes (for example, 128-191 split at 160).
+        # The natural stage order would make a 1:2:1 Talker slice straddle
+        # that boundary. Weight order instead gives the 2/4 Talker share one
+        # complete 32-core NUMA node and splits the other node between the two
+        # lighter stages. Ties retain stage order so every process computes
+        # the same disjoint partition independently.
+        allocation_order = sorted(
+            range(len(weights)),
+            key=lambda stage_index: (-weights[stage_index], stage_index),
+        )
+        allocation_position = allocation_order.index(index)
+        ordered_weights = tuple(weights[stage_index] for stage_index in allocation_order)
+        prior_weight = sum(ordered_weights[:allocation_position])
+        current_weight = prior_weight + weights[index]
+        partitioned: dict[int, list[int]] = {}
+        for npu, cpu_pool in self.npu_cpu_pool.items():
+            ordered = sorted(cpu_pool)
+            start = len(ordered) * prior_weight // total_weight
+            end = len(ordered) * current_weight // total_weight
+            stage_pool = ordered[start:end]
+            if len(stage_pool) < MIN_CPUS_PER_NPU_WITHOUT_IRQ:
+                raise RuntimeError(
+                    f"{STAGE_SLICE_ENV}={index}:{','.join(map(str, weights))} "
+                    f"assigns only {len(stage_pool)} CPUs to NPU {npu}; "
+                    f"at least {MIN_CPUS_PER_NPU_WITHOUT_IRQ} are required"
+                )
+            partitioned[npu] = stage_pool
+        self.npu_cpu_pool = partitioned
+        logger.info(
+            "[cpu_bind_stage_slice] spec=%s:%s pools=%s",
+            index,
+            ",".join(map(str, weights)),
+            self.npu_cpu_pool,
+        )
 
     @staticmethod
     def cpu_to_mask(cpu: int) -> str:
@@ -525,13 +617,16 @@ class CpuAlloc:
     def _is_ascend_950() -> bool:
         return get_ascend_device_type() == AscendDeviceType.A5
 
-    @staticmethod
-    def _reserve_irq_cpus() -> bool:
-        return get_ascend_device_type() not in NO_IRQ_BINDING_DEVICE_TYPES
+    def _reserve_irq_cpus(self) -> bool:
+        # One IRQ pair belongs to the NPU, not to each co-located stage. Leave
+        # IRQ placement untouched when the NPU CPU pool is subdivided.
+        return (
+            getattr(self, "stage_slice", None) is None
+            and get_ascend_device_type() not in NO_IRQ_BINDING_DEVICE_TYPES
+        )
 
-    @staticmethod
-    def _min_cpus_per_npu() -> int:
-        if CpuAlloc._reserve_irq_cpus():
+    def _min_cpus_per_npu(self) -> int:
+        if self._reserve_irq_cpus():
             return MIN_CPUS_PER_NPU
         return MIN_CPUS_PER_NPU_WITHOUT_IRQ
 
@@ -665,7 +760,7 @@ class CpuAlloc:
             return
         # Bind memory to the NPU's NUMA node only to minimize cross-NUMA traffic.
         logger.info("[migrate] NPU:%s -> NUMA [%s]", npu, target_numa)
-        execute_command(
+        output, return_code = execute_command(
             [
                 "migratepages",
                 pid,
@@ -673,6 +768,16 @@ class CpuAlloc:
                 str(target_numa),
             ]
         )
+        if return_code != 0:
+            detail = output.strip() or "no command output"
+            logger.warning(
+                "[migrate] failed for pid=%s, npu=%s, numa=%s: %s. "
+                "The process remains CPU-bound but existing pages keep their current NUMA placement.",
+                pid,
+                npu,
+                target_numa,
+                detail,
+            )
 
     def bind_threads(self) -> None:
         if self._is_ascend_950():
@@ -792,6 +897,7 @@ class CpuAlloc:
     def run_all(self) -> None:
         if not self.build_cpu_pools():
             return
+        self.partition_cpu_pool_for_stage()
         self.allocate()
         self.print_plan()
         self.bind_threads()

@@ -41,7 +41,42 @@ def make_cpu_alloc(rank_id=0):
     cpu_alloc.assign_acl = {}
     cpu_alloc.assign_rel = {}
     cpu_alloc.uvb_cpu_pool = []
+    cpu_alloc.stage_slice = None
     return cpu_alloc
+
+
+class TestStageCpuSlice(unittest.TestCase):
+    def test_parse_stage_slice(self):
+        self.assertEqual(CpuAlloc.parse_stage_slice("1:1,2,1"), (1, (1, 2, 1)))
+        self.assertIsNone(CpuAlloc.parse_stage_slice(None))
+        for value in ("", "1", "3:1,2,1", "1:1,0,1", "x:1,2,1"):
+            if value == "":
+                self.assertIsNone(CpuAlloc.parse_stage_slice(value))
+            else:
+                with self.assertRaises(ValueError):
+                    CpuAlloc.parse_stage_slice(value)
+
+    def test_weighted_stage_slice_is_disjoint_and_favors_talker(self):
+        pools = []
+        for index in range(3):
+            cpu_alloc = make_cpu_alloc()
+            cpu_alloc.npu_cpu_pool = {0: list(range(32))}
+            cpu_alloc.stage_slice = (index, (1, 2, 1))
+            cpu_alloc.partition_cpu_pool_for_stage()
+            pools.append(cpu_alloc.npu_cpu_pool[0])
+
+        self.assertEqual([len(pool) for pool in pools], [8, 16, 8])
+        self.assertEqual(set(pools[0]) & set(pools[1]), set())
+        self.assertEqual(set(pools[1]) & set(pools[2]), set())
+        self.assertEqual(sorted(pools[0] + pools[1] + pools[2]), list(range(32)))
+        self.assertEqual(pools[1], list(range(16)))
+        self.assertEqual(pools[0], list(range(16, 24)))
+        self.assertEqual(pools[2], list(range(24, 32)))
+
+    def test_stage_slice_does_not_rebind_shared_irq(self):
+        cpu_alloc = make_cpu_alloc()
+        cpu_alloc.stage_slice = (1, (1, 2, 1))
+        self.assertFalse(cpu_alloc._reserve_irq_cpus())
 
 
 class TestDeviceInfo(unittest.TestCase):
@@ -218,6 +253,22 @@ class TestDeviceInfo(unittest.TestCase):
         affinity = self.device_info.parse_topo_affinity()
         expected = {0: [0, 1, 2, 3]}
         self.assertEqual(affinity, expected)
+
+    @patch("vllm_ascend.cpu_binding.execute_command")
+    def test_parse_topo_affinity_maps_a2_physical_id_to_visible_logic_id(self, mock_execute_command):
+        device_info = object.__new__(DeviceInfo)
+        device_info.npu_map_info = {"3": {"0": "0"}}
+        mock_execute_command.return_value = ("NPU3 X PHB PHB PHB PHB PHB PHB PHB 128-159", 0)
+
+        self.assertEqual(device_info.parse_topo_affinity(), {0: list(range(128, 160))})
+
+    @patch("vllm_ascend.cpu_binding.execute_command")
+    def test_parse_topo_affinity_preserves_ambiguous_a3_board_id(self, mock_execute_command):
+        device_info = object.__new__(DeviceInfo)
+        device_info.npu_map_info = {"3": {"0": "6", "1": "7"}}
+        mock_execute_command.return_value = ("NPU3 X HCCS HCCS HCCS HCCS HCCS HCCS HCCS 64-95", 0)
+
+        self.assertEqual(device_info.parse_topo_affinity(), {3: list(range(64, 96))})
 
     @patch("vllm_ascend.cpu_binding.execute_command")
     def test_parse_topo_affinity_skips_affinity_header_and_non_npu_rows(self, mock_execute_command):
@@ -954,7 +1005,7 @@ class TestCpuBindingSupplemental(unittest.TestCase):
         mock_execute_command.assert_not_called()
 
     @patch("vllm_ascend.cpu_binding.shutil.which", return_value="/usr/bin/migratepages")
-    @patch("vllm_ascend.cpu_binding.execute_command")
+    @patch("vllm_ascend.cpu_binding.execute_command", return_value=("", 0))
     def test_bind_memory_executes_on_valid_numa_target(self, mock_execute_command, _mock_which):
         cpu_alloc = make_cpu_alloc()
         cpu_alloc.npu_cpu_pool = {0: [8, 9]}
@@ -964,6 +1015,31 @@ class TestCpuBindingSupplemental(unittest.TestCase):
         cpu_alloc.bind_memory("1000", 0)
 
         mock_execute_command.assert_called_once_with(["migratepages", "1000", "0,1", "1"])
+
+    @patch("vllm_ascend.cpu_binding.logger.warning")
+    @patch("vllm_ascend.cpu_binding.shutil.which", return_value="/usr/bin/migratepages")
+    @patch("vllm_ascend.cpu_binding.execute_command", return_value=("Operation not permitted", 1))
+    def test_bind_memory_reports_failed_migration(
+        self,
+        _mock_execute_command,
+        _mock_which,
+        mock_warning,
+    ):
+        cpu_alloc = make_cpu_alloc()
+        cpu_alloc.npu_cpu_pool = {0: [8, 9]}
+        cpu_alloc.cpu_node = {8: 1}
+        cpu_alloc.numa_to_cpu_map = {0: [0], 1: [8, 9]}
+
+        cpu_alloc.bind_memory("1000", 0)
+
+        mock_warning.assert_called_once_with(
+            "[migrate] failed for pid=%s, npu=%s, numa=%s: %s. "
+            "The process remains CPU-bound but existing pages keep their current NUMA placement.",
+            "1000",
+            0,
+            1,
+            "Operation not permitted",
+        )
 
     @patch("vllm_ascend.cpu_binding.psutil.Process")
     @patch(
